@@ -64,6 +64,11 @@ export class ProductQueryDto extends PageOptionsDto {
   @IsOptional()
   readonly sort?: ProductSortBy;
 
+  @Transform(({ value }) => (value === undefined ? undefined : value === true || value === 'true'))
+  @IsBoolean()
+  @IsOptional()
+  readonly flashSaleFirst?: boolean;
+
   @Transform(({ value }) => value === true || value === 'true')
   @IsBoolean()
   @IsOptional()

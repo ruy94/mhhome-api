@@ -125,7 +125,7 @@ export class ProductService {
       ? variantWhere
       : { isDeleted: 0 };
 
-    if (this.requiresInMemorySort(pageOptionsDto)) {
+    if (this.requiresInMemorySort(pageOptionsDto, options)) {
       const items = await this.prisma.product.findMany({
         where,
         include: {
@@ -133,7 +133,7 @@ export class ProductService {
           wholesaleUsers: { select: { userId: true } },
         },
       });
-      const sortedItems = this.sortProductItems(items, pageOptionsDto);
+      const sortedItems = this.sortProductItems(items, pageOptionsDto, options);
       const paginatedItems = this.paginateProductItems(sortedItems, pageOptionsDto);
       const mappedItems = paginatedItems.map((item) => this.mapProductResponse(item, options));
 
@@ -289,26 +289,62 @@ export class ProductService {
     return { createdAt: order };
   }
 
-  private requiresInMemorySort(pageOptionsDto: ProductQueryDto) {
-    const sortBy = this.resolveSortBy(pageOptionsDto);
-    return sortBy === ProductSortBy.PRICE || sortBy === ProductSortBy.STOCK;
+  private shouldSortFlashSaleFirst(pageOptionsDto: ProductQueryDto, options: ProductResponseOptions = {}) {
+    return pageOptionsDto.flashSaleFirst ?? Boolean(options.publicView);
   }
 
-  private sortProductItems(items: ProductListItem[], pageOptionsDto: ProductQueryDto) {
+  private requiresInMemorySort(
+    pageOptionsDto: ProductQueryDto,
+    options: ProductResponseOptions = {},
+  ) {
+    const sortBy = this.resolveSortBy(pageOptionsDto);
+    return (
+      this.shouldSortFlashSaleFirst(pageOptionsDto, options) ||
+      sortBy === ProductSortBy.PRICE ||
+      sortBy === ProductSortBy.STOCK
+    );
+  }
+
+  private sortProductItems(
+    items: ProductListItem[],
+    pageOptionsDto: ProductQueryDto,
+    options: ProductResponseOptions = {},
+  ) {
     const orderMultiplier = (pageOptionsDto.order ?? Order.DESC) === Order.ASC ? 1 : -1;
     const sortBy = this.resolveSortBy(pageOptionsDto);
+    const flashSaleFirst = this.shouldSortFlashSaleFirst(pageOptionsDto, options);
 
     return [...items].sort((a, b) => {
-      if (sortBy === ProductSortBy.PRICE) {
-        return (this.productMinPrice(a) - this.productMinPrice(b)) * orderMultiplier;
+      if (flashSaleFirst) {
+        const aHasFlashSale = this.productHasVisibleActiveFlashSale(a, options);
+        const bHasFlashSale = this.productHasVisibleActiveFlashSale(b, options);
+        if (aHasFlashSale !== bHasFlashSale) return aHasFlashSale ? -1 : 1;
       }
 
-      if (sortBy === ProductSortBy.STOCK) {
-        return (this.productTotalStock(a) - this.productTotalStock(b)) * orderMultiplier;
-      }
+      const sortResult = this.compareProductItems(a, b, sortBy) * orderMultiplier;
+      if (sortResult !== 0) return sortResult;
 
-      return 0;
+      return b.id - a.id;
     });
+  }
+
+  private compareProductItems(a: ProductListItem, b: ProductListItem, sortBy: ProductSortBy) {
+    if (sortBy === ProductSortBy.NAME) return a.name.localeCompare(b.name, 'vi');
+    if (sortBy === ProductSortBy.SOLD) return (a.fakeSold ?? 0) - (b.fakeSold ?? 0);
+    if (sortBy === ProductSortBy.PRICE) return this.productMinPrice(a) - this.productMinPrice(b);
+    if (sortBy === ProductSortBy.STOCK) return this.productTotalStock(a) - this.productTotalStock(b);
+    return a.createdAt.getTime() - b.createdAt.getTime();
+  }
+
+  private productHasVisibleActiveFlashSale(
+    product: ProductListItem,
+    options: ProductResponseOptions = {},
+  ) {
+    if (options.publicView && this.isWholesaleViewer(product, options.viewerUserId)) {
+      return false;
+    }
+
+    return product.variants.some((variant) => variant.flashSaleItems.length > 0);
   }
 
   private paginateProductItems(items: ProductListItem[], pageOptionsDto: ProductQueryDto) {
