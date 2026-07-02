@@ -1,0 +1,749 @@
+// Prisma 7 schema
+// - generator dùng "prisma-client" (KHÔNG phải "prisma-client-js")
+// - datasource KHÔNG chứa `url` — URL được cấu hình trong prisma.config.ts
+// - pgvector: cột `embedding` quản lý qua raw SQL migration (xem migrations/)
+// - tsvector: generated column, quản lý qua raw SQL migration
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================================================================
+// Admin RBAC — Admin, Role, Permission (N-N)
+// =============================================================================
+
+model Admin {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  password  String
+  name      String
+  email     String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  roles     AdminRole[]
+  campaigns Campaign[]
+
+  @@map("admins")
+}
+
+model Role {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+
+  admins      AdminRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  action      String  @unique
+  description String?
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model AdminRole {
+  adminId String @map("admin_id")
+  roleId  String @map("role_id")
+
+  admin Admin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  role  Role  @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([adminId, roleId])
+  @@map("admin_roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+// =============================================================================
+// External service credentials — base-api acts as a tenant of provider systems
+// =============================================================================
+
+model ServiceCredential {
+  id            String    @id @default(cuid())
+  service       String    @unique // "sion-hub"
+  apiKey        String    @default("") @map("api_key") // encrypted
+  webhookSecret String?   @map("webhook_secret")
+  rotatedAt     DateTime? @map("rotated_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@map("service_credentials")
+}
+
+model Banner {
+  id         Int      @id @default(autoincrement())
+  adBanners  String[] @default([]) @map("ad_banners")
+  camBanners String[] @default([]) @map("cam_banners")
+
+  platform UserPlatform @default(ZaloMiniApp) @map("platform")
+
+  @@unique([platform])
+  @@map("banners")
+}
+
+model ZaloVideo {
+  id             Int     @id @default(autoincrement())
+  productId      Int?    @map("product_id")
+  productLink    String? @map("product_link")
+  title          String? @db.VarChar(255)
+  videoUrl       String  @map("video_url") @db.VarChar(255)
+  videoThumbnail String  @map("video_thumbnail") @db.VarChar(255)
+  isDeleted      Int     @default(0) @map("is_deleted") @db.SmallInt()
+
+  @@map("zalo_videos")
+}
+
+model User {
+  id         Int     @id @default(autoincrement())
+  // Zalo identity
+  zaloId     String? @unique @map("zalo_id") @db.Text
+  idbyOA     String? @unique @map("id_by_oa") @db.Text
+  followedOA Boolean @default(false) @map("followed_oa")
+
+  // Website identity
+  email        String? @unique @db.VarChar(255)
+  passwordHash String? @map("password_hash") @db.Text
+
+  // Shared customer profile
+  name            String? @db.VarChar(255)
+  phone           String? @db.VarChar(70)
+  phoneNormalized String? @map("phone_normalized") @db.VarChar(20)
+  avatar          String? @db.VarChar(255)
+
+  // Verification / account state
+  phoneVerifiedAt DateTime?     @map("phone_verified_at")
+  emailVerifiedAt DateTime?     @map("email_verified_at")
+  registeredFrom  UserPlatform  @default(ZaloMiniApp) @map("registered_from")
+  lastLoginFrom   UserPlatform? @map("last_login_from")
+  isGuest         Boolean       @default(false) @map("is_guest")
+  isActive        Boolean       @default(true) @map("is_active")
+
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  userVouchers UserVoucher[]
+  cartItems    CartItem[]
+  wholesaleProducts ProductWholesaleUser[]
+
+  addresses Address[]
+  affiliate Affiliate?
+
+  @@index([phoneNormalized])
+  @@index([registeredFrom])
+  @@map("users")
+}
+
+enum UserPlatform {
+  ZaloMiniApp
+  Website
+}
+
+model Address {
+  id         Int     @id @default(autoincrement())
+  userId     Int?    @map("user_id")
+  cneeName   String? @map("cnee_name") @db.VarChar(255)
+  cneePhone  String? @map("cnee_phone") @db.VarChar(70)
+  idCity     String? @map("id_city") @db.VarChar(20)
+  idDistrict String? @map("id_district") @db.VarChar(20)
+  idWard     String? @map("id_ward") @db.VarChar(20)
+  city       String? @db.VarChar(70)
+  district   String? @db.VarChar(70)
+  ward       String? @db.VarChar(70)
+  fullAddr   String? @map("full_addr") @db.VarChar(255)
+  isDeleted  Int     @default(0) @map("is_deleted") @db.SmallInt()
+  user       User?   @relation(fields: [userId], references: [id])
+
+  @@map("addresses")
+}
+
+model Category {
+  id           Int    @id @default(autoincrement())
+  name         String @db.VarChar(255)
+  image        String @db.VarChar(255)
+  websiteImage String @map("website_image") @db.VarChar(255)
+  isDeleted    Int    @default(0) @map("is_deleted") @db.SmallInt()
+
+  @@map("categories")
+}
+
+model Product {
+  id             Int           @id @default(autoincrement())
+  categoryId     Int[]         @map("category_id")
+  name           String        @db.VarChar(255)
+  detail         String        @db.Text()
+  image          String[]      @db.VarChar(255)
+  videoUrl       String?       @map("video_url") @db.VarChar(255)
+  videoThumbnail String?       @map("video_thumbnail") @db.VarChar(255)
+  source         String?       @db.VarChar(255)
+  warranty       Int?
+  warrantyType   WarrantyType? @map("warranty_type")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  fakeSold         Int?    @map("fake_sold")
+  wholesaleEnabled Boolean @default(false) @map("wholesale_enabled")
+  isDeleted        Int     @default(0) @map("is_deleted") @db.SmallInt()
+
+  tierVariations Json? @map("tier_variations") @db.JsonB
+  // "tierVariations": [
+  //   { "name": "Màu sắc", "options": ["Đỏ", "Xanh"] },
+  //   { "name": "Size", "options": ["S", "M", "L"] }
+  // ]
+
+  // Relationship to Variant (one-to-many)
+  variants             Variant[]             @relation("ProductVariants")
+  // Relationship to Order through OrderProduct
+  orderProducts        OrderProduct[]
+  cartItems            CartItem[]
+  wholesaleUsers       ProductWholesaleUser[]
+  // Relationship to AffiliateCommission
+  affiliateCommissions AffiliateCommission[]
+  voucherProducts      VoucherProduct[]
+
+  @@map("products")
+}
+
+enum WarrantyType {
+  Days
+  Months
+  Years
+}
+
+model Variant {
+  id            Int      @id @default(autoincrement())
+  productId     Int      @map("product_id")
+  name          String   @db.VarChar(255)
+  image         String?  @db.VarChar(255)
+  basePrice             Decimal? @map("base_price") @db.Decimal(15, 0)
+  originalPrice         Decimal  @map("original_price") @db.Decimal(15, 0)
+  wholesaleBasePrice    Decimal? @map("wholesale_base_price") @db.Decimal(15, 0)
+  wholesalePrice        Decimal? @map("wholesale_price") @db.Decimal(15, 0)
+  wholesaleMinQuantity  Int?     @map("wholesale_min_quantity")
+  packageWeightGrams    Int      @default(300) @map("package_weight_grams")
+  packageLengthCm       Decimal? @map("package_length_cm") @db.Decimal(8, 2)
+  packageWidthCm        Decimal? @map("package_width_cm") @db.Decimal(8, 2)
+  packageHeightCm       Decimal? @map("package_height_cm") @db.Decimal(8, 2)
+  stock                 Int
+  isDeleted     Int      @default(0) @map("is_deleted")
+
+  dimensions Json? @db.JsonB
+  // "dimensions": { "Màu sắc": "Đỏ", "Size": "S" }, // <--- Map chính xác với tierVariations
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relationship to Product (one-to-many)
+  product        Product         @relation("ProductVariants", fields: [productId], references: [id])
+  orderProducts  OrderProduct[]
+  flashSaleItems FlashSaleItem[]
+  cartItems      CartItem[]
+
+  @@map("variants")
+}
+
+model ProductWholesaleUser {
+  productId Int      @map("product_id")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([productId, userId])
+  @@index([userId])
+  @@map("product_wholesale_users")
+}
+
+model CartItem {
+  id        Int           @id @default(autoincrement())
+  userId    Int           @map("user_id")
+  productId Int           @map("product_id")
+  variantId Int           @map("variant_id")
+  quantity    Int           @default(1)
+  pricingMode PricingMode   @default(Retail) @map("pricing_mode")
+  platform    OrderPlatform @default(ZaloMiniApp)
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+  variant Variant @relation(fields: [variantId], references: [id])
+
+  @@unique([userId, variantId, platform])
+  @@index([userId, platform])
+  @@index([productId])
+  @@index([variantId])
+  @@map("cart_items")
+}
+
+model OrderProduct {
+  id        Int  @id @default(autoincrement())
+  orderId   Int  @map("order_id")
+  productId Int  @map("product_id")
+  variantId Int? @map("variant_id")
+
+  originalPrice Decimal @map("original_price") @db.Decimal(15, 0)
+  finalPrice    Decimal @map("final_price") @db.Decimal(15, 0) // after flash sale
+  quantity      Int
+  pricingMode   PricingMode @default(Retail) @map("pricing_mode")
+
+  flashSaleId    Int?          @map("flash_sale_id") //snapshot
+  flashSaleType  DiscountType? @map("flash_sale_type")
+  flashSaleValue Decimal?      @map("flash_sale_value")
+
+  itemVoucherId       Int?          @map("item_voucher_id")
+  itemVoucherType     DiscountType? @map("item_voucher_type")
+  itemVoucherValue    Decimal?      @map("item_voucher_value") @db.Decimal(15, 0)
+  itemVoucherDiscount Decimal       @default(0) @map("item_voucher_discount") @db.Decimal(15, 0)
+
+  // Relationships
+  order       Order    @relation(fields: [orderId], references: [id])
+  product     Product  @relation(fields: [productId], references: [id])
+  variant     Variant? @relation(fields: [variantId], references: [id])
+  itemVoucher Voucher? @relation("OrderProductItemVoucher", fields: [itemVoucherId], references: [id])
+
+  @@map("order_products")
+}
+
+enum PricingMode {
+  Retail
+  Wholesale
+}
+
+enum PaymentMethod {
+  COD
+  ZaloPay
+}
+
+model Order {
+  id           Int     @id @default(autoincrement())
+  code         String  @unique @db.VarChar(50)
+  trackingCode String? @map("tracking_code")
+  userId       Int     @map("user_id")
+  addressId    Int     @map("address_id")
+
+  productVoucherId  Int? @map("product_voucher_id")
+  deliveryVoucherId Int? @map("delivery_voucher_id")
+
+  estAmount           Decimal @map("est_amount") @db.Decimal(15, 0) // Subtotal after flash sale and item vouchers, before order voucher and delivery
+  itemVoucherDiscount Decimal @default(0) @map("item_voucher_discount") @db.Decimal(15, 0)
+  productDiscount     Decimal @default(0) @map("product_discount") @db.Decimal(15, 0)
+
+  deliveryFee      Decimal @default(0) @map("delivery_fee") @db.Decimal(15, 0)
+  deliveryDiscount Decimal @default(0) @map("delivery_discount") @db.Decimal(15, 0)
+  deliveryAmount   Decimal @default(0) @map("delivery_amount") @db.Decimal(15, 0)
+
+  totalAmount Decimal @map("total_amount") @db.Decimal(15, 0) // Total price of bill after discounts from product and delivery
+
+  affiliateCode      String? @map("affiliate_code") @db.VarChar(50)
+  affiliateProductId Int?    @map("affiliate_product_id")
+
+  status        OrderStatus   @default(Pending)
+  paymentMethod PaymentMethod @default(COD) @map("payment_method")
+  note          String?       @db.VarChar(255)
+
+  platform OrderPlatform @default(ZaloMiniApp)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relationship to Product through OrderProduct
+  orderProducts OrderProduct[]
+
+  productVoucher  Voucher? @relation("ProductVoucher", fields: [productVoucherId], references: [id])
+  shippingVoucher Voucher? @relation("ShippingVoucher", fields: [deliveryVoucherId], references: [id])
+
+  affiliateCommission AffiliateCommission?
+  shippingOrders      ShippingOrder[]
+
+  @@map("orders")
+}
+
+enum ShippingProvider {
+  SPX
+  JNT
+}
+
+enum ShippingOrderStatus {
+  Estimated
+  Pending
+  Created
+  Failed
+  Cancelled
+}
+
+model ShippingBatch {
+  id              Int                 @id @default(autoincrement())
+  provider        ShippingProvider
+  providerBatchNo String?             @unique @map("provider_batch_no") @db.VarChar(80)
+  taskStatus      Int?                @map("task_status")
+  status          String?             @db.VarChar(50)
+  progress        String?             @db.VarChar(30)
+  totalCount      Int?                @map("total_count")
+  successCount    Int?                @map("success_count")
+  failCount       Int?                @map("fail_count")
+  requestPayload  Json?               @map("request_payload") @db.JsonB
+  responsePayload Json?               @map("response_payload") @db.JsonB
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  shippingOrders ShippingOrder[]
+
+  @@map("shipping_batches")
+}
+
+model ShippingOrder {
+  id              Int                 @id @default(autoincrement())
+  orderId         Int                 @map("order_id")
+  batchId         Int?                @map("batch_id")
+  provider        ShippingProvider
+  status          ShippingOrderStatus @default(Estimated)
+  providerOrderId String?             @map("provider_order_id") @db.VarChar(80)
+  trackingNo                    String?   @map("tracking_no") @db.VarChar(80)
+  trackingLink                  String?   @map("tracking_link") @db.VarChar(255)
+  providerStatus                String?   @map("provider_status") @db.VarChar(100)
+  providerStatusCode            String?   @map("provider_status_code") @db.VarChar(50)
+  trackingSyncedAt              DateTime? @map("tracking_synced_at")
+  estimatedFee                  Decimal?  @map("estimated_fee") @db.Decimal(15, 0)
+  actualFee                     Decimal?  @map("actual_fee") @db.Decimal(15, 0)
+  latestChargeableWeight        Decimal?  @map("latest_chargeable_weight") @db.Decimal(10, 3)
+  latestActualWeight            Decimal?  @map("latest_actual_weight") @db.Decimal(10, 3)
+  latestChargeableParcelLength  Decimal?  @map("latest_chargeable_parcel_length") @db.Decimal(8, 2)
+  latestChargeableParcelWidth   Decimal?  @map("latest_chargeable_parcel_width") @db.Decimal(8, 2)
+  latestChargeableParcelHeight  Decimal?  @map("latest_chargeable_parcel_height") @db.Decimal(8, 2)
+  driverPhoneNumber             String?   @map("driver_phone_number") @db.VarChar(50)
+  requestPayload  Json?               @map("request_payload") @db.JsonB
+  responsePayload Json?               @map("response_payload") @db.JsonB
+  errorMessage    String?             @map("error_message") @db.Text
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  order  Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  batch  ShippingBatch?  @relation(fields: [batchId], references: [id])
+  events ShippingEvent[]
+
+  @@index([orderId])
+  @@index([batchId])
+  @@index([trackingNo])
+  @@map("shipping_orders")
+}
+
+model ShippingEvent {
+  id              Int              @id @default(autoincrement())
+  shippingOrderId Int?             @map("shipping_order_id")
+  provider        ShippingProvider
+  providerEventId String?          @map("provider_event_id") @db.VarChar(160)
+  trackingNo      String?          @map("tracking_no") @db.VarChar(80)
+  providerOrderId String?          @map("provider_order_id") @db.VarChar(80)
+  eventType       String           @map("event_type") @db.VarChar(80)
+  status          String?          @db.VarChar(100)
+  statusCode      String?          @map("status_code") @db.VarChar(50)
+  message         String?          @db.Text
+  happenedAt      DateTime?        @map("happened_at")
+  rawPayload      Json?            @map("raw_payload") @db.JsonB
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  shippingOrder ShippingOrder? @relation(fields: [shippingOrderId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, providerEventId])
+  @@index([shippingOrderId])
+  @@index([trackingNo])
+  @@index([providerOrderId])
+  @@map("shipping_events")
+}
+
+model ShippingWebhookEvent {
+  id          Int              @id @default(autoincrement())
+  provider    ShippingProvider
+  eventId     String?          @map("event_id") @db.VarChar(160)
+  eventType   String           @map("event_type") @db.VarChar(80)
+  payloadHash String           @unique @map("payload_hash") @db.VarChar(64)
+  rawPayload  Json?            @map("raw_payload") @db.JsonB
+  processedAt DateTime?        @map("processed_at")
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  @@index([eventType])
+  @@index([eventId])
+  @@map("shipping_webhook_events")
+}
+
+enum OrderStatus {
+  Pending
+  Prepare
+  Delivering
+  Paid
+  Refund
+  Cancel
+  SoftCancel
+}
+
+enum OrderPlatform {
+  ZaloMiniApp
+  Website
+}
+
+model Voucher {
+  id            Int           @id @default(autoincrement())
+  code          String        @unique @db.VarChar(50)
+  description   String        @default("Chương trình khuyến mãi")
+  type          VoucherType   @default(Normal)
+  scope         VoucherScope  @default(Order)
+  discountType  DiscountType  @map("discount_type")
+  discountValue Decimal       @map("discount_value") @db.Decimal(15, 0) // Giá trị giảm (số tiền hoặc số %)
+  maxDiscount   Decimal?      @map("max_discount") @db.Decimal(15, 0) // Số tiền giảm tối đa (áp dụng cho loại PERCENTAGE)
+  minOrderValue Decimal       @default(0) @map("min_order_value") @db.Decimal(12, 2) // Điều kiện: Tổng đơn hàng tối thiểu để áp dụng
+  usageLimit    Int?          @map("usage_limit") // Tổng số lượt sử dụng tối đa của voucher này
+  usedCount     Int           @default(0) @map("used_count") // Số lượt đã sử dụng thực tế
+  limitPerUser  Int           @default(1) @map("limit_per_user") // Mỗi khách hàng được dùng tối đa bao nhiêu lần
+  validFrom     DateTime      @map("valid_from") // When the voucher becomes valid
+  validUntil    DateTime      @map("valid_until") // When the voucher expires
+  isActive      Boolean       @default(true) @map("is_active")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  isDeleted     Int           @default(0) @map("is_deleted") @db.SmallInt()
+  conditionType ConditionType @default(ZaloMiniApp) @map("condition_type")
+
+  ordersProduct   Order[]          @relation("ProductVoucher")
+  ordersShipping  Order[]          @relation("ShippingVoucher")
+  orderProducts   OrderProduct[]   @relation("OrderProductItemVoucher")
+  userVouchers    UserVoucher[]
+  voucherProducts VoucherProduct[]
+
+  @@index([code])
+  @@map("vouchers")
+}
+
+enum VoucherType {
+  Normal
+  Freeship
+  Secret
+  Hidden
+}
+
+enum VoucherScope {
+  Order
+  Product
+  Shipping
+}
+
+enum DiscountType {
+  Fixed // Ví dụ: Giảm 50k
+  Percentage
+}
+
+enum ConditionType {
+  ZaloMiniApp
+  Tiktok
+  Shopee
+  Facebook
+  Website
+}
+
+// Bảng trung gian để kiểm soát việc sử dụng voucher của từng User
+model UserVoucher {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  voucherId Int       @map("voucher_id")
+  usedAt    DateTime? @map("used_at") // Thời điểm voucher được sử dụng, null nếu chưa dùng
+  voucher   Voucher   @relation(fields: [voucherId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@map("user_vouchers")
+}
+
+model VoucherProduct {
+  voucherId Int @map("voucher_id")
+  productId Int @map("product_id")
+
+  voucher Voucher @relation(fields: [voucherId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@id([voucherId, productId])
+  @@index([productId])
+  @@map("voucher_products")
+}
+
+model FlashSale {
+  id        Int             @id @default(autoincrement())
+  title     String
+  startTime DateTime        @map("start_time")
+  endTime   DateTime        @map("end_time")
+  status    FlashSaleStatus @default(Upcoming)
+  isDeleted Int             @default(0) @map("is_deleted") @db.SmallInt()
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  items FlashSaleItem[]
+
+  @@map("flash_sales")
+}
+
+enum FlashSaleStatus {
+  Upcoming
+  Active
+  Ended
+}
+
+model FlashSaleItem {
+  id              Int          @id @default(autoincrement())
+  flashSaleId     Int          @map("flash_sale_id")
+  variantId       Int          @map("variant_id")
+  discountType    DiscountType @map("discount_type")
+  discountPercent Int?         @map("discount_percent") // e.g. 20 (%)
+  salePrice       Int?         @map("sale_price") // optional fixed price
+  saleStock       Int          @map("sale_stock") // total flash sale quantity
+  sold            Int          @default(0)
+
+  flashSale FlashSale @relation(fields: [flashSaleId], references: [id])
+  variant   Variant   @relation(fields: [variantId], references: [id])
+
+  @@unique([flashSaleId, variantId])
+  @@map("flash_sale_items")
+}
+
+model Review {
+  id             Int      @id @default(autoincrement())
+  productId      Int      @map("product_id")
+  customerName   String?  @map("customer_name") @db.VarChar(50)
+  customerAvatar String?  @map("customer_avatar") @db.VarChar(255)
+  rating         Int?
+  comment        String?  @db.Text()
+  image          String[] @db.VarChar(255)
+  videoUrl       String?  @map("video_url") @db.VarChar(255)
+  videoThumbnail String?  @map("video_thumbnail") @db.VarChar(255)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("reviews")
+}
+
+model Campaign {
+  id Int @id @default(autoincrement())
+
+  // Thông tin định danh
+  name               String  @db.VarChar(255)
+  providerCampaignId String? @unique @map("provider_campaign_id") // ID bên B trả về
+
+  templateId String? @map("template_id") @db.VarChar(50) // VD: "537476"
+
+  // Số liệu thống kê (Sync từ B về)
+  total   Int // Đã ghi nhận (Tổng số)
+  sent    Int     @default(0) // Đã gửi (Thường bằng Success + Failed)
+  success Int     @default(0) // Gửi thành công
+  failed  Int     @default(0) // Gửi lỗi
+  cost    Decimal @default(0) @db.Decimal(15, 0)
+
+  status     CampaignStatus @default(PROCESSING)
+  failReason String?        @map("fail_reason") @db.Text
+
+  // Relation: Ai tạo?
+  creatorId String @map("creator_id")
+  creator   Admin  @relation(fields: [creatorId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("campaigns")
+}
+
+enum CampaignStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ==================== AFFILIATE ====================
+
+model Affiliate {
+  id             Int             @id @default(autoincrement())
+  userId         Int             @unique @map("user_id")
+  refCode        String          @unique @map("ref_code") @db.VarChar(50)
+  status         AffiliateStatus @default(Pending)
+  commissionRate Int             @default(5) @map("commission_rate")
+  bankName       String?         @map("bank_name") @db.VarChar(100)
+  bankAccount    String?         @map("bank_account") @db.VarChar(50)
+  bankHolder     String?         @map("bank_holder") @db.VarChar(100)
+  totalEarned    Decimal         @default(0) @map("total_earned") @db.Decimal(15, 0)
+  totalWithdrawn Decimal         @default(0) @map("total_withdrawn") @db.Decimal(15, 0)
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  user        User                  @relation(fields: [userId], references: [id])
+  commissions AffiliateCommission[]
+  withdrawals AffiliateWithdrawal[]
+
+  @@map("affiliates")
+}
+
+enum AffiliateStatus {
+  Pending
+  Approved
+  Rejected
+  Suspended
+}
+
+model AffiliateCommission {
+  id               Int              @id @default(autoincrement())
+  affiliateId      Int              @map("affiliate_id")
+  orderId          Int              @unique @map("order_id")
+  productId        Int              @map("product_id")
+  productAmount    Decimal          @map("product_amount") @db.Decimal(15, 0)
+  commissionRate   Int              @map("commission_rate")
+  commissionAmount Decimal          @map("commission_amount") @db.Decimal(15, 0)
+  status           CommissionStatus @default(Pending)
+  note             String?          @db.Text
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  affiliate Affiliate @relation(fields: [affiliateId], references: [id])
+  order     Order     @relation(fields: [orderId], references: [id])
+  product   Product   @relation(fields: [productId], references: [id])
+
+  @@map("affiliate_commissions")
+}
+
+enum CommissionStatus {
+  Pending
+  Approved
+  Rejected
+  Paid
+}
+
+model AffiliateWithdrawal {
+  id          Int              @id @default(autoincrement())
+  affiliateId Int              @map("affiliate_id")
+  amount      Decimal          @db.Decimal(15, 0)
+  status      WithdrawalStatus @default(Pending)
+  bankName    String           @map("bank_name") @db.VarChar(100)
+  bankAccount String           @map("bank_account") @db.VarChar(50)
+  bankHolder  String           @map("bank_holder") @db.VarChar(100)
+  adminNote   String?          @map("admin_note") @db.Text
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+
+  affiliate Affiliate @relation(fields: [affiliateId], references: [id])
+
+  @@map("affiliate_withdrawals")
+}
+
+enum WithdrawalStatus {
+  Pending
+  Processing
+  Completed
+  Rejected
+}
