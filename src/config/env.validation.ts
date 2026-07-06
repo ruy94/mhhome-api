@@ -174,6 +174,31 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsString()
   SPX_SENDER_LATITUDE?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  SALEWORK_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  SALEWORK_CLIENT_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  SALEWORK_TOKEN?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SALEWORK_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @IsString()
+  SALEWORK_STOCK_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  SALEWORK_BANKING_BASE_URL?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {

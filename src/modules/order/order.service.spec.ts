@@ -12,6 +12,9 @@ jest.mock('../../generated/prisma/client.js', () => ({
   DiscountType,
   OrderPlatform: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
   OrderStatus: { Paid: 'Paid', Refund: 'Refund', Cancel: 'Cancel' },
+  PricingMode: { Retail: 'Retail', Wholesale: 'Wholesale' },
+  SaleWorkOutboxOperation: { Export: 'Export', Return: 'Return' },
+  SaleWorkOutboxStatus: { Pending: 'Pending', Success: 'Success', Failed: 'Failed' },
   Prisma: {},
   PrismaClient: class {},
   UserPlatform: { Website: 'Website', ZaloMiniApp: 'ZaloMiniApp' },
@@ -22,7 +25,15 @@ jest.mock('../../generated/prisma/client.js', () => ({
 import { OrderService } from './order.service.js';
 
 describe('OrderService product item vouchers', () => {
-  const createService = () => new OrderService({} as never, {} as never, {} as never);
+  const createService = () =>
+    new OrderService(
+      {} as never,
+      {} as never,
+      {} as never,
+      { estimateCheckoutDeliveryFee: jest.fn().mockResolvedValue({ deliveryFee: 0, shippingQuote: null }) } as never,
+      {} as never,
+      {} as never,
+    );
 
   const createTx = (variants: unknown[], voucher: unknown) =>
     ({

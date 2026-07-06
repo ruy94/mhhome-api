@@ -243,6 +243,8 @@ model Variant {
   packageWidthCm        Decimal? @map("package_width_cm") @db.Decimal(8, 2)
   packageHeightCm       Decimal? @map("package_height_cm") @db.Decimal(8, 2)
   stock                 Int
+  saleworkProductCode  String?  @map("salework_product_code") @db.VarChar(255)
+  saleworkWarehouseId  String?  @map("salework_warehouse_id") @db.VarChar(255)
   isDeleted     Int      @default(0) @map("is_deleted")
 
   dimensions Json? @db.JsonB
@@ -252,10 +254,12 @@ model Variant {
 
   // Relationship to Product (one-to-many)
   product        Product         @relation("ProductVariants", fields: [productId], references: [id])
-  orderProducts  OrderProduct[]
-  flashSaleItems FlashSaleItem[]
-  cartItems      CartItem[]
+  orderProducts      OrderProduct[]
+  flashSaleItems     FlashSaleItem[]
+  cartItems          CartItem[]
+  saleWorkOutboxLogs SaleWorkOutboxLog[]
 
+  @@unique([saleworkProductCode, saleworkWarehouseId])
   @@map("variants")
 }
 
@@ -366,7 +370,8 @@ model Order {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   // Relationship to Product through OrderProduct
-  orderProducts OrderProduct[]
+  orderProducts      OrderProduct[]
+  saleWorkOutboxLogs SaleWorkOutboxLog[]
 
   productVoucher  Voucher? @relation("ProductVoucher", fields: [productVoucherId], references: [id])
   shippingVoucher Voucher? @relation("ShippingVoucher", fields: [deliveryVoucherId], references: [id])
@@ -493,6 +498,41 @@ enum OrderStatus {
   Refund
   Cancel
   SoftCancel
+}
+
+enum SaleWorkOutboxOperation {
+  Export
+  Return
+}
+
+enum SaleWorkOutboxStatus {
+  Pending
+  Success
+  Failed
+}
+
+model SaleWorkOutboxLog {
+  id              Int                     @id @default(autoincrement())
+  orderId         Int                     @map("order_id")
+  variantId       Int                     @map("variant_id")
+  operation       SaleWorkOutboxOperation
+  warehouseId     String                  @map("warehouse_id") @db.VarChar(255)
+  productCode     String                  @map("product_code") @db.VarChar(255)
+  quantity        Int
+  status          SaleWorkOutboxStatus    @default(Pending)
+  requestPayload  Json?                   @map("request_payload") @db.JsonB
+  responsePayload Json?                   @map("response_payload") @db.JsonB
+  errorMessage    String?                 @map("error_message")
+  createdAt       DateTime                @default(now()) @map("created_at")
+  updatedAt       DateTime                @updatedAt @map("updated_at")
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  variant Variant @relation(fields: [variantId], references: [id])
+
+  @@unique([orderId, variantId, operation])
+  @@index([status])
+  @@index([operation, status])
+  @@map("salework_outbox_logs")
 }
 
 enum OrderPlatform {

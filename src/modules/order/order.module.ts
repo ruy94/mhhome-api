@@ -7,9 +7,11 @@ import { MiniappShippingController } from './miniapp-shipping.controller.js';
 import { WebsiteShippingController } from './website-shipping.controller.js';
 import { AffiliateModule } from '../affiliate/affiliate.module.js';
 import { ShippingModule } from '../shipping/shipping.module.js';
+import { SaleWorkStockSyncModule } from '../salework-sync/salework-stock-sync.module.js';
+import { OrderInventoryModule } from '../order-inventory/order-inventory.module.js';
 
 @Module({
-  imports: [AffiliateModule, ShippingModule],
+  imports: [AffiliateModule, ShippingModule, SaleWorkStockSyncModule, OrderInventoryModule],
   controllers: [OrderController, MiniappOrderController, WebsiteOrderController, MiniappShippingController, WebsiteShippingController],
   providers: [OrderService],
   exports: [OrderService],

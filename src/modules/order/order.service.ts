@@ -26,6 +26,8 @@ import { PageMetaDto } from '../../common/dtos/page-meta.dto.js';
 import { AffiliateService } from '../affiliate/affiliate.service.js';
 import { ShippingService } from '../shipping/shipping.service.js';
 import type { ShippingEstimateResult } from '../shipping/shipping.types.js';
+import { SaleWorkStockSyncService } from '../salework-sync/salework-stock-sync.service.js';
+import { OrderInventoryService } from '../order-inventory/order-inventory.service.js';
 
 const ORDER_VOUCHER_TYPES: VoucherType[] = [
   VoucherType.Normal,
@@ -123,6 +125,8 @@ export class OrderService {
     private configService: ConfigService,
     private affiliateService: AffiliateService,
     private shippingService: ShippingService,
+    private saleWorkStockSync: SaleWorkStockSyncService,
+    private orderInventory: OrderInventoryService,
   ) {}
 
   generateOrderCode(): string {
@@ -148,7 +152,7 @@ export class OrderService {
   }
 
   async createWebsiteOrder(dto: CreateOrderDto) {
-    return this.prisma.$transaction(async (tx) => {
+    const order = await this.prisma.$transaction(async (tx) => {
       const checkoutDto = await this.resolveWebsiteCheckoutDto(tx, dto);
       return this.createForPlatformTx(
         tx,
@@ -157,6 +161,8 @@ export class OrderService {
         ConditionType.Website,
       );
     });
+    await this.saleWorkStockSync.exportOrderStock(order.id);
+    return order;
   }
 
   async quoteMiniappOrder(dto: CreateOrderDto) {
@@ -250,9 +256,11 @@ export class OrderService {
     platform: OrderPlatform,
     voucherConditionType: ConditionType,
   ) {
-    return this.prisma.$transaction((tx) =>
+    const order = await this.prisma.$transaction((tx) =>
       this.createForPlatformTx(tx, dto, platform, voucherConditionType),
     );
+    await this.saleWorkStockSync.exportOrderStock(order.id);
+    return order;
   }
 
   private async createForPlatformTx(
@@ -1215,9 +1223,13 @@ export class OrderService {
         ? OrderStatus.SoftCancel
         : dto.status;
 
-    const updated = await this.prisma.order.update({
-      where: { id },
-      data: { status: nextStatus },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { id },
+        data: { status: nextStatus },
+      });
+      await this.orderInventory.restoreIfFinalCancelled(order.id, order.status, nextStatus, tx);
+      return updatedOrder;
     });
 
     // Tạo commission khi đơn hàng hoàn thành
@@ -1243,6 +1255,8 @@ export class OrderService {
     ) {
       await this.affiliateService.rejectCommissionByOrder(order.id);
     }
+
+    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(order.id, order.status, nextStatus);
 
     return updated;
   }

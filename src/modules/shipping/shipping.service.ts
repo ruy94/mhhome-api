@@ -21,6 +21,8 @@ import {
   SPX_DELIVERY_UNAVAILABLE_MESSAGE,
   SPX_PICKUP_UNAVAILABLE_MESSAGE,
 } from './spx-address-normalizer.js';
+import { SaleWorkStockSyncService } from '../salework-sync/salework-stock-sync.service.js';
+import { OrderInventoryService } from '../order-inventory/order-inventory.service.js';
 
 const SPX_VN_MAX_PARCEL_WEIGHT_GRAMS = 15_000;
 const SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE =
@@ -34,6 +36,8 @@ export class ShippingService {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly spxClient: SpxShippingClientService,
+    private readonly saleWorkStockSync: SaleWorkStockSyncService,
+    private readonly orderInventory: OrderInventoryService,
   ) {}
 
   isSpxEnabled() {
@@ -226,17 +230,23 @@ export class ShippingService {
 
     const shippingOrder = order.shippingOrders[0];
     if (!shippingOrder?.trackingNo) {
-      return this.prisma.order.update({
-        where: { id: orderId },
-        data: { status: OrderStatus.Cancel },
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const updatedOrder = await tx.order.update({
+          where: { id: orderId },
+          data: { status: OrderStatus.Cancel },
+        });
+        await this.orderInventory.restoreIfFinalCancelled(orderId, order.status, OrderStatus.Cancel, tx);
+        return updatedOrder;
       });
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(orderId, order.status, OrderStatus.Cancel);
+      return updated;
     }
 
     const result = await this.spxClient.cancelOrders([shippingOrder.trackingNo]);
     const failure = result.failures.find((item) => item.trackingNo === shippingOrder.trackingNo);
     if (failure) throw new BadRequestException(failure.message || 'SPX hủy vận đơn thất bại');
 
-    return this.prisma.$transaction(async (tx) => {
+    const updatedOrder = await this.prisma.$transaction(async (tx) => {
       await tx.shippingOrder.update({
         where: { id: shippingOrder.id },
         data: {
@@ -257,11 +267,15 @@ export class ShippingService {
           rawPayload: this.toJson(result.raw),
         },
       });
-      return tx.order.update({
+      const updated = await tx.order.update({
         where: { id: orderId },
         data: { status: OrderStatus.Cancel },
       });
+      await this.orderInventory.restoreIfFinalCancelled(orderId, order.status, OrderStatus.Cancel, tx);
+      return updated;
     });
+    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(orderId, order.status, OrderStatus.Cancel);
+    return updatedOrder;
   }
 
   async refreshBatch(batchId: number) {
@@ -373,7 +387,22 @@ export class ShippingService {
     const [track] = await this.spxClient.trackOrders({ trackingNos: [shippingOrder.trackingNo] });
     if (!track) throw new BadRequestException('SPX không trả về thông tin vận đơn');
 
-    return this.prisma.$transaction((tx) => this.applyTrackOrderResult(tx, shippingOrder.id, track));
+    const previousOrder = await this.prisma.order.findUnique({
+      where: { id: shippingOrder.orderId },
+      select: { status: true },
+    });
+    const mappedStatus = this.mapSpxStatusToOrderStatus(track.status, track.statusCode);
+    const result = await this.prisma.$transaction(async (tx) => {
+      const updated = await this.applyTrackOrderResult(tx, shippingOrder.id, track);
+      if (previousOrder && mappedStatus) {
+        await this.orderInventory.restoreIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus, tx);
+      }
+      return updated;
+    });
+    if (previousOrder && mappedStatus) {
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus);
+    }
+    return result;
   }
 
   async confirmSpxOrder(orderId: number, operation: 1 | 2) {
@@ -500,6 +529,13 @@ export class ShippingService {
     providerOrderId?: string,
   ) {
     const shippingOrder = await this.findShippingOrderForProviderPayload(trackingNo, providerOrderId);
+    const previousOrder = shippingOrder
+      ? await this.prisma.order.findUnique({ where: { id: shippingOrder.orderId }, select: { status: true } })
+      : null;
+    const mappedStatus = this.mapSpxStatusToOrderStatus(
+      this.asString(payload.status),
+      this.asString(payload.status_code),
+    );
 
     await this.prisma.$transaction(async (tx) => {
       if (shippingOrder) {
@@ -536,10 +572,6 @@ export class ShippingService {
           },
         });
 
-        const mappedStatus = this.mapSpxStatusToOrderStatus(
-          this.asString(payload.status),
-          this.asString(payload.status_code),
-        );
         if (trackingNo || mappedStatus) {
           await tx.order.updateMany({
             where: {
@@ -551,6 +583,10 @@ export class ShippingService {
               ...(mappedStatus ? { status: mappedStatus } : {}),
             },
           });
+        }
+
+        if (previousOrder && mappedStatus) {
+          await this.orderInventory.restoreIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus, tx);
         }
       }
 
@@ -575,6 +611,10 @@ export class ShippingService {
         skipDuplicates: true,
       });
     });
+
+    if (shippingOrder && previousOrder && mappedStatus) {
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus);
+    }
   }
 
   private async applyTrackOrderResult(
@@ -816,7 +856,7 @@ export class ShippingService {
       lengthCm,
       widthCm,
       heightCm,
-      itemName: parcelItems[0]?.name ?? 'MH Home order',
+      itemName: parcelItems[0]?.name ?? 'Zalo order',
       itemQuantity: totalQuantity,
       insuredValue: quoteItems.reduce((sum, item) => sum + item.finalPrice * item.quantity, 0),
       items: parcelItems,

@@ -11,6 +11,7 @@ import databaseConfig from './config/database.config.js';
 import redisConfig from './config/redis.config.js';
 import sionHubConfig from './config/sion-hub.config.js';
 import shippingConfig from './config/shipping.config.js';
+import saleworkConfig from './config/salework.config.js';
 import zaloConfig from './config/zalo.config.js';
 import { validateEnv } from './config/env.validation.js';
 
@@ -48,6 +49,7 @@ import { ZaloVideoModule } from './modules/zalo-video/zalo-video.module.js';
 import { ZbsModule } from './modules/zbs/zbs.module.js';
 import { SocketModule } from './modules/socket/socket.module.js';
 import { SionHubModule } from './modules/integrations/sion-hub/sion-hub.module.js';
+import { SaleworkModule } from './modules/salework/salework.module.js';
 import { WebhookReceiverModule } from './modules/webhook-receiver/webhook-receiver.module.js';
 
 const vietnamDateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -87,7 +89,15 @@ function vietnamTimestamp(): string {
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
-      load: [appConfig, databaseConfig, redisConfig, sionHubConfig, shippingConfig, zaloConfig],
+      load: [
+        appConfig,
+        databaseConfig,
+        redisConfig,
+        sionHubConfig,
+        shippingConfig,
+        saleworkConfig,
+        zaloConfig,
+      ],
       validate: validateEnv,
       envFilePath: [`.env.${process.env.NODE_ENV ?? 'development'}`],
     }),
@@ -164,6 +174,7 @@ function vietnamTimestamp(): string {
     BillingModule,
     CampaignModule,
     ZbsModule,
+    SaleworkModule,
     SocketModule,
     SionHubModule,
     WebhookReceiverModule,

@@ -106,6 +106,11 @@ const PERMISSIONS = [
   // ZBS
   { action: 'zbs:view', description: 'Xem template/quota ZBS' },
   { action: 'zbs:send', description: 'Gửi chiến dịch ZBS' },
+  // Salework
+  { action: 'salework:view', description: 'Xem dữ liệu Salework' },
+  { action: 'salework:create', description: 'Tạo đơn Salework' },
+  { action: 'salework:warehouse', description: 'Thao tác nhập/xuất/hoàn kho Salework' },
+  { action: 'salework:banking', description: 'Thao tác merchant/công nợ/QR Salework Banking' },
 ];
 
 async function main() {

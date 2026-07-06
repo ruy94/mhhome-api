@@ -1,14 +1,19 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { UpdateVariantDto } from './dto/update-variant.dto.js';
+import { LinkSaleworkVariantDto } from './dto/link-salework-variant.dto.js';
 import { Prisma, FlashSaleStatus } from '../../generated/prisma/client.js';
 import { UploadService } from '../upload/upload.service.js';
+import { ConfigService } from '@nestjs/config';
+import { SaleworkClientService } from '../integrations/salework/salework-client.service.js';
 
 @Injectable()
 export class VariantService {
   constructor(
     private prisma: PrismaService,
     private readonly uploadService: UploadService,
+    private readonly configService: ConfigService,
+    private readonly saleworkClient: SaleworkClientService,
   ) {}
 
   async findOne(id: number) {
@@ -59,6 +64,52 @@ export class VariantService {
       return await tx.variant.findUnique({
         where: { id },
       });
+    });
+  }
+
+
+  async linkSalework(id: number, dto: LinkSaleworkVariantDto) {
+    const saleworkProductCode = dto.saleworkProductCode.trim();
+    const saleworkWarehouseId = dto.saleworkWarehouseId.trim();
+
+    const variant = await this.prisma.variant.findUnique({ where: { id, isDeleted: 0 } });
+    if (!variant) throw new NotFoundException('Variant not found');
+
+    const linked = await this.prisma.variant.findFirst({
+      where: {
+        id: { not: id },
+        isDeleted: 0,
+        saleworkProductCode,
+        saleworkWarehouseId,
+      },
+      select: { id: true },
+    });
+    if (linked) throw new BadRequestException('SKU SaleWork này đã được liên kết với SKU khác');
+
+    if (this.configService.get<boolean>('salework.enabled') === true) {
+      const salework = await this.saleworkClient.getProducts();
+      const product = salework.products[saleworkProductCode];
+      const hasWarehouse = salework.warehouses.some((warehouse) => warehouse.wid === saleworkWarehouseId);
+      const hasStockInWarehouse = product?.stocks?.some((stock) => stock.wid === saleworkWarehouseId);
+
+      if (!product || !hasWarehouse || !hasStockInWarehouse) {
+        throw new BadRequestException('SKU hoặc kho SaleWork không hợp lệ');
+      }
+    }
+
+    return this.prisma.variant.update({
+      where: { id },
+      data: { saleworkProductCode, saleworkWarehouseId },
+    });
+  }
+
+  async unlinkSalework(id: number) {
+    const variant = await this.prisma.variant.findUnique({ where: { id, isDeleted: 0 } });
+    if (!variant) throw new NotFoundException('Variant not found');
+
+    return this.prisma.variant.update({
+      where: { id },
+      data: { saleworkProductCode: null, saleworkWarehouseId: null },
     });
   }
 
