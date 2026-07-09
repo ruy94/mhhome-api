@@ -182,4 +182,23 @@ describe('OrderService product item vouchers', () => {
       expect.objectContaining({ variantId: 102, itemVoucherId: 9, itemVoucherDiscount: 10000 }),
     );
   });
+
+  it('rejects order voucher when retail eligible amount produces no discount', async () => {
+    const service = createService();
+    const tx = {
+      voucher: {
+        findFirst: jest.fn().mockResolvedValue(
+          createProductVoucher({
+            scope: VoucherScope.Order,
+            minOrderValue: 0,
+          }),
+        ),
+      },
+    } as never;
+
+    await expect(
+      (service as any).applyProductVoucher(tx, 9, 0, 'ZaloMiniApp'),
+    ).rejects.toThrow('Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ');
+  });
+
 });

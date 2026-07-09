@@ -895,9 +895,14 @@ export class OrderService {
       throw new BadRequestException('Voucher toàn đơn đã hết lượt sử dụng');
     }
 
+    const discount = this.calculateVoucherDiscount(voucher, estAmount);
+    if (discount <= 0) {
+      throw new BadRequestException('Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ');
+    }
+
     return {
       voucherId: voucher.id,
-      discount: this.calculateVoucherDiscount(voucher, estAmount),
+      discount,
       voucher: this.serializeVoucher(voucher),
     };
   }
