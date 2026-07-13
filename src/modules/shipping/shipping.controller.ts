@@ -7,6 +7,7 @@ import { ShippingService } from './shipping.service.js';
 import { ConfirmSpxOrderDto } from './dto/confirm-spx-order.dto.js';
 import { BatchSpxOrdersDto } from './dto/batch-spx-orders.dto.js';
 import { GetShippingAwbDto } from './dto/get-shipping-awb.dto.js';
+import { RefreshSpxTrackingsDto } from './dto/refresh-spx-trackings.dto.js';
 
 @Controller('shipping')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
@@ -53,6 +54,12 @@ export class ShippingController {
   @RequirePermissions('order:view')
   refreshTracking(@Param('orderId', ParseIntPipe) orderId: number) {
     return this.shippingService.refreshTracking(orderId);
+  }
+
+  @Post('orders/tracking/refresh')
+  @RequirePermissions('order:view')
+  refreshTrackings(@Body() dto: RefreshSpxTrackingsDto) {
+    return this.shippingService.refreshTrackings({ orderIds: dto.orderIds });
   }
 
   @Post('orders/:orderId/confirm')

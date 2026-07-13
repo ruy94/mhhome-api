@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 
@@ -42,6 +43,23 @@ export class ShippingService {
 
   isSpxEnabled() {
     return this.configService.get<boolean>('shipping.spx.enabled') === true;
+  }
+
+  @Cron('0 */10 * * * *')
+  async handleSpxTrackingCron() {
+    if (!this.isSpxEnabled()) return;
+
+    try {
+      const result = await this.refreshTrackings({ limit: 200 });
+      if (result.total > 0) {
+        this.logger.log(
+          `SPX tracking cron: refreshed ${result.refreshed}/${result.total}, failed ${result.failed}`,
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to refresh SPX tracking';
+      this.logger.warn(`SPX tracking cron failed: ${message}`);
+    }
   }
 
   async estimateCheckoutDeliveryFee(
@@ -405,6 +423,106 @@ export class ShippingService {
     return result;
   }
 
+  async refreshTrackings(input: { orderIds?: number[]; limit?: number } = {}) {
+    this.assertSpxEnabled();
+
+    const uniqueOrderIds = input.orderIds
+      ? [...new Set(input.orderIds)].filter((id) => Number.isInteger(id) && id > 0)
+      : undefined;
+    const candidates = await this.prisma.shippingOrder.findMany({
+      where: {
+        provider: ShippingProvider.SPX,
+        trackingNo: { not: null },
+        order: {
+          status: {
+            in: [OrderStatus.Pending, OrderStatus.Prepare, OrderStatus.Delivering, OrderStatus.SoftCancel],
+          },
+          ...(uniqueOrderIds ? { id: { in: uniqueOrderIds } } : {}),
+        },
+      },
+      include: { order: { select: { status: true } } },
+      orderBy: { createdAt: 'desc' },
+      ...(input.limit ? { take: input.limit } : {}),
+    });
+
+    const latestByOrderId = new Map<number, (typeof candidates)[number]>();
+    for (const shippingOrder of candidates) {
+      if (!latestByOrderId.has(shippingOrder.orderId)) latestByOrderId.set(shippingOrder.orderId, shippingOrder);
+    }
+
+    const shippingOrders = [...latestByOrderId.values()];
+    const skipped = uniqueOrderIds ? Math.max(uniqueOrderIds.length - shippingOrders.length, 0) : 0;
+    if (!shippingOrders.length) return { total: 0, refreshed: 0, failed: 0, skipped };
+
+    const trackingToShippingOrder = new Map<string, (typeof shippingOrders)[number]>();
+    const providerOrderToShippingOrder = new Map<string, (typeof shippingOrders)[number]>();
+    for (const shippingOrder of shippingOrders) {
+      if (shippingOrder.trackingNo) trackingToShippingOrder.set(shippingOrder.trackingNo, shippingOrder);
+      if (shippingOrder.providerOrderId) providerOrderToShippingOrder.set(shippingOrder.providerOrderId, shippingOrder);
+    }
+
+    let refreshed = 0;
+    let failed = 0;
+    const trackingNos = [...trackingToShippingOrder.keys()];
+    for (let index = 0; index < trackingNos.length; index += 50) {
+      const chunk = trackingNos.slice(index, index + 50);
+      let tracks: ShippingTrackOrderResult[] = [];
+
+      try {
+        tracks = await this.spxClient.trackOrders({ trackingNos: chunk });
+      } catch (error) {
+        failed += chunk.length;
+        const message = error instanceof Error ? error.message : 'SPX track order failed';
+        this.logger.warn(`SPX tracking refresh failed for ${chunk.length} orders: ${message}`);
+        continue;
+      }
+
+      const matchedShippingOrderIds = new Set<number>();
+      for (const track of tracks) {
+        const shippingOrder =
+          (track.trackingNo ? trackingToShippingOrder.get(track.trackingNo) : undefined) ??
+          (track.providerOrderId ? providerOrderToShippingOrder.get(track.providerOrderId) : undefined);
+        if (!shippingOrder) continue;
+
+        matchedShippingOrderIds.add(shippingOrder.id);
+        const mappedStatus = this.mapSpxStatusToOrderStatus(track.status, track.statusCode);
+
+        try {
+          await this.prisma.$transaction(async (tx) => {
+            await this.applyTrackOrderResult(tx, shippingOrder.id, track);
+            if (mappedStatus) {
+              await this.orderInventory.restoreIfFinalCancelled(
+                shippingOrder.orderId,
+                shippingOrder.order.status,
+                mappedStatus,
+                tx,
+              );
+            }
+          });
+          if (mappedStatus) {
+            await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+              shippingOrder.orderId,
+              shippingOrder.order.status,
+              mappedStatus,
+            );
+          }
+          refreshed += 1;
+        } catch (error) {
+          failed += 1;
+          const message = error instanceof Error ? error.message : 'Unable to apply SPX tracking result';
+          this.logger.warn(`SPX tracking apply failed for order #${shippingOrder.orderId}: ${message}`);
+        }
+      }
+
+      failed += chunk.filter((trackingNo) => {
+        const shippingOrder = trackingToShippingOrder.get(trackingNo);
+        return shippingOrder ? !matchedShippingOrderIds.has(shippingOrder.id) : true;
+      }).length;
+    }
+
+    return { total: shippingOrders.length, refreshed, failed, skipped };
+  }
+
   async confirmSpxOrder(orderId: number, operation: 1 | 2) {
     this.assertSpxEnabled();
 
@@ -576,7 +694,7 @@ export class ShippingService {
           await tx.order.updateMany({
             where: {
               id: shippingOrder.orderId,
-              ...(mappedStatus === OrderStatus.Cancel ? {} : { status: { not: OrderStatus.SoftCancel } }),
+              ...(mappedStatus === OrderStatus.Cancel || mappedStatus === OrderStatus.Return ? {} : { status: { not: OrderStatus.SoftCancel } }),
             },
             data: {
               ...(trackingNo ? { trackingCode: trackingNo } : {}),
@@ -639,7 +757,7 @@ export class ShippingService {
       await tx.order.updateMany({
         where: {
           id: updated.orderId,
-          ...(mappedStatus === OrderStatus.Cancel ? {} : { status: { not: OrderStatus.SoftCancel } }),
+          ...(mappedStatus === OrderStatus.Cancel || mappedStatus === OrderStatus.Return ? {} : { status: { not: OrderStatus.SoftCancel } }),
         },
         data: {
           ...(track.trackingNo ? { trackingCode: track.trackingNo } : {}),
@@ -692,6 +810,13 @@ export class ShippingService {
     const value = `${statusCode ?? ''} ${status ?? ''}`.toLowerCase();
     if (!value.trim()) return undefined;
 
+    if (
+      value.includes('6001') ||
+      value.includes('return') ||
+      value.includes('rts')
+    ) {
+      return OrderStatus.Return;
+    }
     if (value.includes('cancel')) return OrderStatus.Cancel;
     if (value.includes('delivered') || value.includes('delivery done') || value.includes('completed')) {
       return OrderStatus.Paid;

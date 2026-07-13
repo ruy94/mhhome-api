@@ -13,8 +13,9 @@ export class OrderInventoryService {
     nextStatus: OrderStatus,
     tx?: Prisma.TransactionClient,
   ) {
-    if (nextStatus !== OrderStatus.Cancel && nextStatus !== OrderStatus.Refund) return;
-    if (previousStatus === OrderStatus.Cancel || previousStatus === OrderStatus.Refund) return;
+    const finalCancelledStatuses: OrderStatus[] = [OrderStatus.Cancel, OrderStatus.Refund, OrderStatus.Return];
+    if (!finalCancelledStatuses.includes(nextStatus)) return;
+    if (finalCancelledStatuses.includes(previousStatus)) return;
 
     if (tx) {
       await this.restoreOrderItems(tx, orderId);

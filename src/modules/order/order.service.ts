@@ -1255,7 +1255,7 @@ export class OrderService {
 
     // Từ chối commission khi đơn hàng bị hoàn hoặc huỷ
     if (
-      (nextStatus === OrderStatus.Refund || nextStatus === OrderStatus.Cancel) &&
+      (nextStatus === OrderStatus.Refund || nextStatus === OrderStatus.Cancel || nextStatus === OrderStatus.Return) &&
       order.affiliateCode
     ) {
       await this.affiliateService.rejectCommissionByOrder(order.id);

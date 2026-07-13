@@ -49,8 +49,9 @@ export class SaleWorkStockSyncService {
   }
 
   async returnOrderStockIfFinalCancelled(orderId: number, previousStatus: OrderStatus, nextStatus: OrderStatus) {
-    if (nextStatus !== OrderStatus.Cancel && nextStatus !== OrderStatus.Refund) return;
-    if (previousStatus === OrderStatus.Cancel || previousStatus === OrderStatus.Refund) return;
+    const finalCancelledStatuses: OrderStatus[] = [OrderStatus.Cancel, OrderStatus.Refund, OrderStatus.Return];
+    if (!finalCancelledStatuses.includes(nextStatus)) return;
+    if (finalCancelledStatuses.includes(previousStatus)) return;
     if (!this.isEnabled()) return;
 
     const exportLogs = await this.prisma.saleWorkOutboxLog.findMany({

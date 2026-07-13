@@ -11,7 +11,7 @@ jest.mock('../../generated/prisma/client.js', () => ({
   ConditionType: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
   DiscountType,
   OrderPlatform: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
-  OrderStatus: { Paid: 'Paid', Refund: 'Refund', Cancel: 'Cancel' },
+  OrderStatus: { Paid: 'Paid', Refund: 'Refund', Cancel: 'Cancel', Return: 'Return' },
   PricingMode: { Retail: 'Retail', Wholesale: 'Wholesale' },
   SaleWorkOutboxOperation: { Export: 'Export', Return: 'Return' },
   SaleWorkOutboxStatus: { Pending: 'Pending', Success: 'Success', Failed: 'Failed' },

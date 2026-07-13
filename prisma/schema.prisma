@@ -498,6 +498,7 @@ enum OrderStatus {
   Refund
   Cancel
   SoftCancel
+  Return
 }
 
 enum SaleWorkOutboxOperation {
