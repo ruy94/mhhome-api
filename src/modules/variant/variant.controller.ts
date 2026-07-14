@@ -24,7 +24,7 @@ export class VariantController {
   }
 
   @Patch(':id/salework-link')
-  @RequirePermissions('variant:update')
+  @RequirePermissions('salework:warehouse')
   async linkSalework(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: LinkSaleworkVariantDto,
@@ -33,7 +33,7 @@ export class VariantController {
   }
 
   @Delete(':id/salework-link')
-  @RequirePermissions('variant:update')
+  @RequirePermissions('salework:warehouse')
   async unlinkSalework(@Param('id', ParseIntPipe) id: number) {
     return await this.variantService.unlinkSalework(id);
   }

@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
 import { SaleworkClientService } from '../integrations/salework/salework-client.service.js';
+import { PrismaService } from '../../prisma/prisma.service.js';
 import type {
   SaleworkAddressData,
   SaleworkInventoryTransactionsData,
@@ -21,10 +22,82 @@ import type { SaleworkWarehouseTransactionDto } from './dto/salework-warehouse.d
 
 @Injectable()
 export class SaleworkService {
-  constructor(private readonly saleworkClient: SaleworkClientService) {}
+  constructor(
+    private readonly saleworkClient: SaleworkClientService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   getProducts(): Promise<SaleworkProductsData> {
     return this.saleworkClient.getProducts();
+  }
+
+  async syncLinkedVariantStocks() {
+    const salework = await this.saleworkClient.getProducts();
+    const variants = await this.prisma.variant.findMany({
+      where: {
+        isDeleted: 0,
+        saleworkProductCode: { not: null },
+        saleworkWarehouseId: { not: null },
+      },
+      select: {
+        id: true,
+        saleworkProductCode: true,
+        saleworkWarehouseId: true,
+      },
+    });
+
+    const items: Array<{
+      variantId: number;
+      saleworkProductCode: string;
+      saleworkWarehouseId: string;
+      saleworkStock: number;
+      appliedStock: number;
+    }> = [];
+    const skippedItems: Array<{
+      variantId: number;
+      saleworkProductCode: string;
+      saleworkWarehouseId: string;
+      reason: string;
+    }> = [];
+
+    for (const variant of variants) {
+      const saleworkProductCode = variant.saleworkProductCode?.trim();
+      const saleworkWarehouseId = variant.saleworkWarehouseId?.trim();
+      if (!saleworkProductCode || !saleworkWarehouseId) continue;
+
+      const product = salework.products[saleworkProductCode];
+      const saleworkStock = product?.stocks?.find((stock) => stock.wid === saleworkWarehouseId)?.value;
+      if (saleworkStock === undefined) {
+        skippedItems.push({
+          variantId: variant.id,
+          saleworkProductCode,
+          saleworkWarehouseId,
+          reason: 'Không tìm thấy SKU hoặc kho SaleWork',
+        });
+        continue;
+      }
+
+      const appliedStock = Math.max(0, saleworkStock);
+      await this.prisma.variant.update({
+        where: { id: variant.id },
+        data: { stock: appliedStock },
+      });
+      items.push({
+        variantId: variant.id,
+        saleworkProductCode,
+        saleworkWarehouseId,
+        saleworkStock,
+        appliedStock,
+      });
+    }
+
+    return {
+      totalLinked: variants.length,
+      updated: items.length,
+      skipped: skippedItems.length,
+      items,
+      skippedItems,
+    };
   }
 
   getAddressList(): Promise<SaleworkAddressData> {

@@ -1059,10 +1059,34 @@ export class OrderService {
   }
 
   async findAll(pageOptionsDto: OrderPageOptionsDto) {
+    const keyword = pageOptionsDto.q?.trim();
     const where: Prisma.OrderWhereInput = {
-      ...(pageOptionsDto.q ? { code: { contains: pageOptionsDto.q, mode: 'insensitive' } } : {}),
       ...(pageOptionsDto.status ? { status: pageOptionsDto.status } : {}),
     };
+
+    if (keyword) {
+      const digits = keyword.replace(/\D/g, '');
+      const addressFilters: Prisma.AddressWhereInput[] = [
+        { cneeName: { contains: keyword, mode: 'insensitive' } },
+        { cneePhone: { contains: keyword, mode: 'insensitive' } },
+      ];
+
+      if (digits && digits !== keyword) {
+        addressFilters.push({ cneePhone: { contains: digits, mode: 'insensitive' } });
+      }
+
+      const matchedAddresses = await this.prisma.address.findMany({
+        where: { OR: addressFilters },
+        select: { id: true },
+      });
+      const addressIds = matchedAddresses.map((address) => address.id);
+
+      if (addressIds.length === 0) {
+        return new PageDto([], new PageMetaDto({ itemCount: 0, pageOptionsDto }));
+      }
+
+      where.addressId = { in: addressIds };
+    }
 
     if (pageOptionsDto.shippingStage === 'processing') {
       where.status = OrderStatus.Pending;

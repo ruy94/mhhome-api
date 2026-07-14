@@ -37,6 +37,14 @@ export class SaleworkController {
     return this.saleworkService.getProducts();
   }
 
+
+  @Post('products/sync-stock')
+  @RequirePermissions('salework:warehouse')
+  @ApiOperation({ summary: 'Đồng bộ tồn kho Variant đã liên kết từ Salework' })
+  syncLinkedVariantStocks() {
+    return this.saleworkService.syncLinkedVariantStocks();
+  }
+
   @Get('addresses')
   @RequirePermissions('salework:view')
   @ApiOperation({ summary: 'Lấy danh sách địa chỉ từ Salework' })

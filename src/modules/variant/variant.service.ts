@@ -46,7 +46,6 @@ export class VariantService {
           originalPrice: dto.originalPrice,
           wholesaleBasePrice: dto.wholesaleBasePrice,
           wholesalePrice: dto.wholesalePrice,
-          wholesaleMinQuantity: dto.wholesaleMinQuantity,
           packageWeightGrams: dto.packageWeightGrams,
           packageLengthCm: dto.packageLengthCm,
           packageWidthCm: dto.packageWidthCm,
@@ -86,20 +85,24 @@ export class VariantService {
     });
     if (linked) throw new BadRequestException('SKU SaleWork này đã được liên kết với SKU khác');
 
+    const updateData: Prisma.VariantUpdateInput = { saleworkProductCode, saleworkWarehouseId };
+
     if (this.configService.get<boolean>('salework.enabled') === true) {
       const salework = await this.saleworkClient.getProducts();
       const product = salework.products[saleworkProductCode];
       const hasWarehouse = salework.warehouses.some((warehouse) => warehouse.wid === saleworkWarehouseId);
-      const hasStockInWarehouse = product?.stocks?.some((stock) => stock.wid === saleworkWarehouseId);
+      const saleworkStock = product?.stocks?.find((stock) => stock.wid === saleworkWarehouseId)?.value;
 
-      if (!product || !hasWarehouse || !hasStockInWarehouse) {
+      if (!product || !hasWarehouse || saleworkStock === undefined) {
         throw new BadRequestException('SKU hoặc kho SaleWork không hợp lệ');
       }
+
+      updateData.stock = Math.max(0, saleworkStock);
     }
 
     return this.prisma.variant.update({
       where: { id },
-      data: { saleworkProductCode, saleworkWarehouseId },
+      data: updateData,
     });
   }
 

@@ -202,3 +202,89 @@ describe('OrderService product item vouchers', () => {
   });
 
 });
+
+
+describe('OrderService admin order search', () => {
+  const createService = (prisma: Record<string, unknown>) =>
+    new OrderService(
+      prisma as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  const createOrder = () => ({
+    id: 10,
+    code: 'ORD001',
+    userId: 1,
+    addressId: 20,
+    createdAt: new Date('2026-07-14T00:00:00.000Z'),
+    estAmount: 100000,
+    itemVoucherDiscount: 0,
+    productDiscount: 0,
+    deliveryFee: 20000,
+    deliveryDiscount: 0,
+    deliveryAmount: 20000,
+    totalAmount: 120000,
+    shippingOrders: [],
+    orderProducts: [],
+  });
+
+  it('filters admin orders by receiver name or phone instead of internal order code', async () => {
+    const order = createOrder();
+    const prisma = {
+      address: {
+        findMany: jest
+          .fn()
+          .mockResolvedValueOnce([{ id: 20 }])
+          .mockResolvedValueOnce([{ id: 20, cneeName: 'Nguyen Lan', cneePhone: '0901 222 333' }]),
+      },
+      order: {
+        findMany: jest.fn().mockResolvedValue([order]),
+        count: jest.fn().mockResolvedValue(1),
+      },
+      user: { findMany: jest.fn().mockResolvedValue([{ id: 1, name: 'Lan' }]) },
+      $transaction: jest.fn((queries) => Promise.all(queries as Promise<unknown>[])),
+    };
+    const service = createService(prisma);
+
+    const result = await service.findAll({ q: '0901-222', status: 'Paid', page: 1, limit: 20, order: 'desc' } as never);
+
+    expect(prisma.address.findMany).toHaveBeenNthCalledWith(1, {
+      where: {
+        OR: [
+          { cneeName: { contains: '0901-222', mode: 'insensitive' } },
+          { cneePhone: { contains: '0901-222', mode: 'insensitive' } },
+          { cneePhone: { contains: '0901222', mode: 'insensitive' } },
+        ],
+      },
+      select: { id: true },
+    });
+    expect(prisma.order.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { status: 'Paid', addressId: { in: [20] } },
+      }),
+    );
+    expect(result.items[0]).toEqual(expect.objectContaining({ id: 10, address: expect.objectContaining({ id: 20 }) }));
+    expect(result.meta.total).toBe(1);
+  });
+
+  it('returns an empty admin order page when no receiver matches the search', async () => {
+    const prisma = {
+      address: { findMany: jest.fn().mockResolvedValue([]) },
+      order: { findMany: jest.fn(), count: jest.fn() },
+      user: { findMany: jest.fn() },
+      $transaction: jest.fn(),
+    };
+    const service = createService(prisma);
+
+    const result = await service.findAll({ q: 'khong ton tai', page: 1, limit: 20, order: 'desc' } as never);
+
+    expect(result.items).toEqual([]);
+    expect(result.meta.total).toBe(0);
+    expect(prisma.order.findMany).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+});
