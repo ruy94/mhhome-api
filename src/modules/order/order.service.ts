@@ -1062,7 +1062,16 @@ export class OrderService {
     const keyword = pageOptionsDto.q?.trim();
     const where: Prisma.OrderWhereInput = {
       ...(pageOptionsDto.status ? { status: pageOptionsDto.status } : {}),
+      ...(pageOptionsDto.paymentMethod ? { paymentMethod: pageOptionsDto.paymentMethod } : {}),
+      ...(pageOptionsDto.platform ? { platform: pageOptionsDto.platform } : {}),
     };
+
+    if (pageOptionsDto.createdFrom || pageOptionsDto.createdTo) {
+      where.createdAt = {
+        ...(pageOptionsDto.createdFrom ? { gte: new Date(pageOptionsDto.createdFrom) } : {}),
+        ...(pageOptionsDto.createdTo ? { lte: new Date(pageOptionsDto.createdTo) } : {}),
+      };
+    }
 
     if (keyword) {
       const digits = keyword.replace(/\D/g, '');

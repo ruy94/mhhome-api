@@ -1,5 +1,5 @@
-import { IsEnum, IsIn, IsOptional } from 'class-validator';
-import { OrderStatus } from '../../../generated/prisma/client.js';
+import { IsDateString, IsEnum, IsIn, IsOptional } from 'class-validator';
+import { OrderPlatform, OrderStatus, PaymentMethod } from '../../../generated/prisma/client.js';
 import { PageOptionsDto } from '../../../common/dtos/page-options.dto.js';
 
 export type OrderShippingStage = 'processing' | 'waiting_pickup';
@@ -12,4 +12,20 @@ export class OrderPageOptionsDto extends PageOptionsDto {
   @IsIn(['processing', 'waiting_pickup'])
   @IsOptional()
   readonly shippingStage?: OrderShippingStage;
+
+  @IsDateString()
+  @IsOptional()
+  readonly createdFrom?: string;
+
+  @IsDateString()
+  @IsOptional()
+  readonly createdTo?: string;
+
+  @IsEnum(PaymentMethod)
+  @IsOptional()
+  readonly paymentMethod?: PaymentMethod;
+
+  @IsEnum(OrderPlatform)
+  @IsOptional()
+  readonly platform?: OrderPlatform;
 }
