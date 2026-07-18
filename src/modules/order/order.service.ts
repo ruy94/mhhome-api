@@ -1114,7 +1114,9 @@ export class OrderService {
         skip: pageOptionsDto.skip,
         take: pageOptionsDto.take,
         include: {
-          shippingOrders: true,
+          shippingOrders: pageOptionsDto.includeShippingEvents
+            ? { include: { events: { orderBy: [{ happenedAt: 'asc' }, { createdAt: 'asc' }] } } }
+            : true,
           orderProducts: {
             include: {
               product: { select: { id: true, name: true, image: true } },

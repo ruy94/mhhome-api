@@ -1,4 +1,5 @@
-import { IsDateString, IsEnum, IsIn, IsOptional } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsBoolean, IsDateString, IsEnum, IsIn, IsOptional } from 'class-validator';
 import { OrderPlatform, OrderStatus, PaymentMethod } from '../../../generated/prisma/client.js';
 import { PageOptionsDto } from '../../../common/dtos/page-options.dto.js';
 
@@ -28,4 +29,9 @@ export class OrderPageOptionsDto extends PageOptionsDto {
   @IsEnum(OrderPlatform)
   @IsOptional()
   readonly platform?: OrderPlatform;
+
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  @IsOptional()
+  readonly includeShippingEvents?: boolean;
 }
