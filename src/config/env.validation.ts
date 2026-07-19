@@ -36,6 +36,10 @@ export class EnvironmentVariables {
   @IsString()
   LOG_LEVEL?: string;
 
+  @IsOptional()
+  @IsBoolean()
+  ELECTRONIC_INVOICE_ENABLED?: boolean;
+
   @IsString()
   ZALO_OA_ID!: string;
 

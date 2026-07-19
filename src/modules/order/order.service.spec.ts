@@ -13,6 +13,8 @@ jest.mock('../../generated/prisma/client.js', () => ({
   OrderPlatform: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
   OrderStatus: { Paid: 'Paid', Refund: 'Refund', Cancel: 'Cancel', Return: 'Return' },
   PricingMode: { Retail: 'Retail', Wholesale: 'Wholesale' },
+  PaymentMethod: { COD: 'COD', ZaloPay: 'ZaloPay' },
+  ShippingProvider: { SPX: 'SPX', JNT: 'JNT' },
   SaleWorkOutboxOperation: { Export: 'Export', Return: 'Return' },
   SaleWorkOutboxStatus: { Pending: 'Pending', Success: 'Success', Failed: 'Failed' },
   Prisma: {},

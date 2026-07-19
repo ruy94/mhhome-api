@@ -30,6 +30,10 @@ File được load tự động dựa trên `NODE_ENV`:
 
 Prisma CLI cũng đọc cùng cơ chế (`.env.$NODE_ENV`), nên khi chạy migrate/seed có thể prefix `NODE_ENV` để chọn env.
 
+Feature flag theo từng dự án:
+
+- `ELECTRONIC_INVOICE_ENABLED` — bật/tắt yêu cầu hóa đơn điện tử đồng thời cho app, website và admin; mặc định `false`.
+
 Các biến SionHub dùng khi project này được đăng ký như một tenant ở `sion-hub`:
 
 - `SION_HUB_URL` — base URL của SionHub, ví dụ `https://sion.example.com/api/v1`

@@ -1,5 +1,9 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { CreateOrderDto, WebsiteShippingEstimateDto } from './dto/create-order.dto.js';
+import {
+  CreateOrderDto,
+  ElectronicInvoiceType,
+  WebsiteShippingEstimateDto,
+} from './dto/create-order.dto.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { createHash, randomInt } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
@@ -129,6 +133,57 @@ export class OrderService {
     private orderInventory: OrderInventoryService,
   ) {}
 
+  private isElectronicInvoiceEnabled() {
+    return (
+      this.configService.get<boolean>('app.features.electronicInvoiceEnabled') ===
+      true
+    );
+  }
+
+  private normalizeElectronicInvoiceRequest(
+    dto: CreateOrderDto,
+  ): Prisma.InputJsonValue | undefined {
+    const invoice = dto.invoiceRequest;
+    if (!invoice) return undefined;
+    if (!this.isElectronicInvoiceEnabled()) {
+      throw new BadRequestException('Hóa đơn điện tử chưa được hỗ trợ');
+    }
+
+    return {
+      type: invoice.type,
+      customerName: invoice.customerName.trim(),
+      ...(invoice.type !== ElectronicInvoiceType.Individual
+        ? { entityName: invoice.entityName?.trim() }
+        : {}),
+      address: invoice.address.trim(),
+      taxCode: invoice.taxCode.trim(),
+      email: invoice.email.trim().toLowerCase(),
+      ...(invoice.type === ElectronicInvoiceType.Individual && invoice.citizenId
+        ? { citizenId: invoice.citizenId.trim() }
+        : {}),
+    };
+  }
+
+  private maskElectronicInvoiceRequest(value: Prisma.JsonValue | null) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const invoice = value as Record<string, Prisma.JsonValue>;
+    const taxCode = typeof invoice.taxCode === 'string' ? invoice.taxCode : '';
+    const email = typeof invoice.email === 'string' ? invoice.email : '';
+    const [emailName = '', emailDomain = ''] = email.split('@');
+
+    return {
+      type: invoice.type,
+      customerName: invoice.customerName,
+      entityName: invoice.entityName,
+      taxCode: taxCode
+        ? `${'*'.repeat(Math.max(0, taxCode.length - 4))}${taxCode.slice(-4)}`
+        : '',
+      email: emailDomain
+        ? `${emailName.slice(0, 2)}${'*'.repeat(Math.max(2, emailName.length - 2))}@${emailDomain}`
+        : '',
+    };
+  }
+
   generateOrderCode(): string {
     const seed = `${Date.now()}-${process.hrtime.bigint().toString()}-${randomInt(1, 1_000_000_000)}`;
     const hash = createHash('sha256').update(seed).digest('hex');
@@ -148,7 +203,15 @@ export class OrderService {
   }
 
   async createMiniappOrder(dto: CreateOrderDto) {
-    return this.createForPlatform(dto, OrderPlatform.ZaloMiniApp, ConditionType.ZaloMiniApp);
+    const order = await this.createForPlatform(
+      dto,
+      OrderPlatform.ZaloMiniApp,
+      ConditionType.ZaloMiniApp,
+    );
+    return {
+      ...order,
+      invoiceRequest: this.maskElectronicInvoiceRequest(order.invoiceRequest),
+    };
   }
 
   async createWebsiteOrder(dto: CreateOrderDto) {
@@ -275,6 +338,7 @@ export class OrderService {
 
     const userId = dto.userId;
     const addressId = dto.addressId;
+    const invoiceRequest = this.normalizeElectronicInvoiceRequest(dto);
 
     const quote = await this.calculateOrderQuote(tx, dto, voucherConditionType);
     const orderItems = quote.items;
@@ -308,6 +372,7 @@ export class OrderService {
         totalAmount: quote.totalAmount,
         paymentMethod: dto.paymentMethod,
         note: dto.note?.trim() || null,
+        invoiceRequest,
         platform,
         affiliateCode: dto.affiliateCode,
         affiliateProductId: dto.affiliateProductId,
@@ -1044,6 +1109,7 @@ export class OrderService {
       deliveryDiscount: Number(order.deliveryDiscount),
       deliveryAmount: Number(order.deliveryAmount),
       totalAmount: Number(order.totalAmount),
+      invoiceRequest: this.maskElectronicInvoiceRequest(order.invoiceRequest),
       shippingOrders: this.serializeShippingOrders(order.shippingOrders),
       orderProducts: order.orderProducts.map((item) => ({
         ...item,
@@ -1180,14 +1246,19 @@ export class OrderService {
   }
 
   async findWebsiteOrderForUser(userId: number, id: number) {
-    return this.findOneByPlatform(id, OrderPlatform.Website, userId);
+    return this.findOneByPlatform(id, OrderPlatform.Website, userId, true);
   }
 
   async findOne(id: number) {
-    return this.findOneByPlatform(id);
+    return this.findOneByPlatform(id, undefined, undefined, true);
   }
 
-  private async findOneByPlatform(id: number, platform?: OrderPlatform, userId?: number) {
+  private async findOneByPlatform(
+    id: number,
+    platform?: OrderPlatform,
+    userId?: number,
+    includeSensitiveInvoice = false,
+  ) {
     const order = await this.prisma.order.findFirst({
       where: { id, ...(platform ? { platform } : {}), ...(userId ? { userId } : {}) },
       include: {
@@ -1224,6 +1295,9 @@ export class OrderService {
       deliveryDiscount: Number(order.deliveryDiscount),
       deliveryAmount: Number(order.deliveryAmount),
       totalAmount: Number(order.totalAmount),
+      invoiceRequest: includeSensitiveInvoice
+        ? order.invoiceRequest
+        : this.maskElectronicInvoiceRequest(order.invoiceRequest),
       shippingOrders: this.serializeShippingOrders(order.shippingOrders),
       orderProducts: order.orderProducts.map((p) => ({
         ...p,

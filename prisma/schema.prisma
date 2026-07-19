@@ -363,6 +363,7 @@ model Order {
   status        OrderStatus   @default(Pending)
   paymentMethod PaymentMethod @default(COD) @map("payment_method")
   note          String?       @db.VarChar(255)
+  invoiceRequest Json?        @map("invoice_request") @db.JsonB
 
   platform OrderPlatform @default(ZaloMiniApp)
 

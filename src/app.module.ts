@@ -51,6 +51,7 @@ import { SocketModule } from './modules/socket/socket.module.js';
 import { SionHubModule } from './modules/integrations/sion-hub/sion-hub.module.js';
 import { SaleworkModule } from './modules/salework/salework.module.js';
 import { WebhookReceiverModule } from './modules/webhook-receiver/webhook-receiver.module.js';
+import { PublicConfigModule } from './modules/public-config/public-config.module.js';
 
 const vietnamDateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Ho_Chi_Minh',
@@ -102,6 +103,7 @@ function vietnamTimestamp(): string {
       envFilePath: [`.env.${process.env.NODE_ENV ?? 'development'}`],
     }),
 
+    PublicConfigModule,
     WinstonModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

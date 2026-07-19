@@ -5,6 +5,9 @@ export default registerAs('app', () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   apiPrefix: process.env.API_PREFIX ?? 'api/v1',
   logLevel: process.env.LOG_LEVEL ?? 'info',
+  features: {
+    electronicInvoiceEnabled: process.env.ELECTRONIC_INVOICE_ENABLED === 'true',
+  },
   jwt: {
     accessSecret: process.env.JWT_ACCESS_SECRET ?? '',
     refreshSecret: process.env.JWT_REFRESH_SECRET ?? '',
