@@ -185,6 +185,71 @@ describe('OrderService product item vouchers', () => {
     );
   });
 
+
+  it('applies an order voucher to a retail flash-sale line', async () => {
+    const service = createService();
+    const tx = createTx(
+      [
+        {
+          id: 101,
+          productId: 1,
+          name: 'Red / M',
+          image: null,
+          dimensions: null,
+          stock: 5,
+          originalPrice: 100000,
+          product: {
+            id: 1,
+            name: 'Dress',
+            image: [],
+            wholesaleEnabled: false,
+            wholesaleUsers: [],
+          },
+          flashSaleItems: [
+            {
+              id: 1,
+              flashSaleId: 2,
+              discountType: DiscountType.Fixed,
+              discountPercent: null,
+              salePrice: 80000,
+              saleStock: 5,
+              sold: 0,
+            },
+          ],
+        },
+      ],
+      createProductVoucher({
+        code: 'ORDER10',
+        scope: VoucherScope.Order,
+        discountType: DiscountType.Fixed,
+        discountValue: 10000,
+        voucherProducts: [],
+      }),
+    );
+
+    const quote = await (service as any).calculateOrderQuote(
+      tx,
+      {
+        userId: 1,
+        addressId: 1,
+        deliveryFee: 0,
+        orderVoucherId: 9,
+        items: [{ productId: 1, variantId: 101, quantity: 1 }],
+      },
+      'ZaloMiniApp',
+    );
+
+    expect(quote.items[0]).toEqual(
+      expect.objectContaining({
+        pricingMode: 'Retail',
+        flashSaleId: 2,
+        finalPrice: 80000,
+      }),
+    );
+    expect(quote.productDiscount).toBe(10000);
+    expect(quote.totalAmount).toBe(70000);
+  });
+
   it('rejects order voucher when retail eligible amount produces no discount', async () => {
     const service = createService();
     const tx = {

@@ -1,5 +1,14 @@
 import { plainToInstance } from 'class-transformer';
-import { IsBoolean, IsEnum, IsIn, IsInt, IsOptional, IsString, Min, validateSync } from 'class-validator';
+import {
+  IsBoolean,
+  IsEnum,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+  validateSync,
+} from 'class-validator';
 
 enum AppEnv {
   development = 'development',
@@ -206,7 +215,25 @@ export class EnvironmentVariables {
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
-  const validated = plainToInstance(EnvironmentVariables, config, {
+  const normalizedConfig = { ...config };
+  const booleanKeys = ['ELECTRONIC_INVOICE_ENABLED', 'SPX_ENABLED', 'SALEWORK_ENABLED'] as const;
+
+  for (const key of booleanKeys) {
+    const value = normalizedConfig[key];
+    if (value === undefined || typeof value === 'boolean') continue;
+
+    if (typeof value === 'string') {
+      const normalizedValue = value.trim().toLowerCase();
+      if (normalizedValue === 'true' || normalizedValue === 'false') {
+        normalizedConfig[key] = normalizedValue === 'true';
+        continue;
+      }
+    }
+
+    throw new Error(`Env validation failed:\n${key} must be either "true" or "false"`);
+  }
+
+  const validated = plainToInstance(EnvironmentVariables, normalizedConfig, {
     enableImplicitConversion: true,
   });
   const errors = validateSync(validated, { skipMissingProperties: false });

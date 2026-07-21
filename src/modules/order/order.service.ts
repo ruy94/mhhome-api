@@ -962,7 +962,11 @@ export class OrderService {
 
     const discount = this.calculateVoucherDiscount(voucher, estAmount);
     if (discount <= 0) {
-      throw new BadRequestException('Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ');
+      throw new BadRequestException(
+        estAmount <= 0
+          ? 'Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ'
+          : 'Voucher toàn đơn không tạo được giá trị giảm cho đơn hàng hiện tại',
+      );
     }
 
     return {
