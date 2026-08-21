@@ -12,6 +12,7 @@ import redisConfig from './config/redis.config.js';
 import sionHubConfig from './config/sion-hub.config.js';
 import shippingConfig from './config/shipping.config.js';
 import saleworkConfig from './config/salework.config.js';
+import marketplaceConfig from './config/marketplace.config.js';
 import zaloConfig from './config/zalo.config.js';
 import { validateEnv } from './config/env.validation.js';
 
@@ -52,6 +53,8 @@ import { SionHubModule } from './modules/integrations/sion-hub/sion-hub.module.j
 import { SaleworkModule } from './modules/salework/salework.module.js';
 import { WebhookReceiverModule } from './modules/webhook-receiver/webhook-receiver.module.js';
 import { PublicConfigModule } from './modules/public-config/public-config.module.js';
+import { MarketplaceModule } from './modules/marketplace/marketplace.module.js';
+import { AdminNotificationModule } from './modules/admin-notification/admin-notification.module.js';
 
 const vietnamDateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Ho_Chi_Minh',
@@ -97,6 +100,7 @@ function vietnamTimestamp(): string {
         sionHubConfig,
         shippingConfig,
         saleworkConfig,
+        marketplaceConfig,
         zaloConfig,
       ],
       validate: validateEnv,
@@ -180,6 +184,8 @@ function vietnamTimestamp(): string {
     SocketModule,
     SionHubModule,
     WebhookReceiverModule,
+    MarketplaceModule,
+    AdminNotificationModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: GlobalExceptionFilter },

@@ -1,4 +1,4 @@
-import { PaymentMethod, ShippingProvider } from '../../../generated/prisma/client.js';
+import { PaymentMethod, ShippingProvider } from '../../../generated/prisma/enums.js';
 import { Type } from 'class-transformer';
 import {
   ArrayMinSize,

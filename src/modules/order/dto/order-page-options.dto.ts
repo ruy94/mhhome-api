@@ -4,8 +4,13 @@ import { OrderPlatform, OrderStatus, PaymentMethod } from '../../../generated/pr
 import { PageOptionsDto } from '../../../common/dtos/page-options.dto.js';
 
 export type OrderShippingStage = 'processing' | 'waiting_pickup';
+export type OrderScope = 'local' | 'marketplace' | 'all';
 
 export class OrderPageOptionsDto extends PageOptionsDto {
+  @IsIn(['local', 'marketplace', 'all'])
+  @IsOptional()
+  readonly scope?: OrderScope;
+
   @IsEnum(OrderStatus)
   @IsOptional()
   readonly status?: OrderStatus;

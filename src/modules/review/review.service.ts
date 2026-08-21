@@ -8,12 +8,14 @@ import { BulkCreateReviewDto } from './dto/bulk-create-review.dto.js';
 import { UpdateReviewDto } from './dto/update-review.dto.js';
 import { ReviewQueryDto } from './dto/review-query.dto.js';
 import { UploadService } from '../upload/upload.service.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
 @Injectable()
 export class ReviewService {
   constructor(
     private prisma: PrismaService,
     private readonly uploadService: UploadService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
   ) {}
 
   async findReviewsByProduct(productId: number, pageOptionsDto: ReviewQueryDto) {
@@ -65,9 +67,16 @@ export class ReviewService {
       createdAt: review.createdAt,
     }));
 
-    return await this.prisma.review.createMany({
-      data,
-      skipDuplicates: false,
+    return this.prisma.$transaction(async (tx) => {
+      const created = await tx.review.createMany({
+        data,
+        skipDuplicates: false,
+      });
+      await this.marketplaceCatalog.recordProductChanges(
+        tx,
+        data.map((review) => review.productId),
+      );
+      return created;
     });
   }
 
@@ -110,6 +119,7 @@ export class ReviewService {
       ) {
         await this.uploadService.deleteVideo(existingReview.videoUrl);
       }
+      await this.marketplaceCatalog.recordProductChanges(tx, [existingReview.productId]);
       return await tx.review.findUnique({
         where: { id },
       });
@@ -135,9 +145,11 @@ export class ReviewService {
       if (existingReview.videoUrl) {
         await this.uploadService.deleteVideo(existingReview.videoUrl);
       }
-      return await tx.review.delete({
+      const removed = await tx.review.delete({
         where: { id },
       });
+      await this.marketplaceCatalog.recordProductChanges(tx, [existingReview.productId]);
+      return removed;
     });
   }
 }

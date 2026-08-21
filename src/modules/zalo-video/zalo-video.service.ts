@@ -6,24 +6,32 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { UploadService } from '../upload/upload.service.js';
 import { CreateZaloVideoDto } from './dto/create-zalo-video.dto.js';
 import { UpdateZaloVideoDto } from './dto/update-zalo-video.dto.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
 @Injectable()
 export class ZaloVideoService {
   constructor(
     private prisma: PrismaService,
     private readonly uploadService: UploadService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
   ) {}
 
   /** Create a single Zalo video record from already uploaded media. */
   async create(dto: CreateZaloVideoDto) {
-    return await this.prisma.zaloVideo.create({
-      data: {
-        productId: dto.productId ?? 0,
-        productLink: dto.productLink ?? '',
-        title: dto.title ?? '',
-        videoUrl: dto.videoUrl,
-        videoThumbnail: dto.videoThumbnail,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const created = await tx.zaloVideo.create({
+        data: {
+          productId: dto.productId ?? 0,
+          productLink: dto.productLink ?? '',
+          title: dto.title ?? '',
+          videoUrl: dto.videoUrl,
+          videoThumbnail: dto.videoThumbnail,
+        },
+      });
+      if (created.productId) {
+        await this.marketplaceCatalog.recordProductChanges(tx, [created.productId]);
+      }
+      return created;
     });
   }
 
@@ -101,9 +109,10 @@ export class ZaloVideoService {
     }
 
     try {
-      const created = await this.prisma.$transaction(
-        uploaded.map((item, index) =>
-          this.prisma.zaloVideo.create({
+      const created = await this.prisma.$transaction(async (tx) => {
+        const rows = await Promise.all(
+          uploaded.map((item, index) =>
+            tx.zaloVideo.create({
             data: {
               productId,
               title: titles[index] ?? '',
@@ -111,9 +120,12 @@ export class ZaloVideoService {
               videoUrl: item.videoUrl,
               videoThumbnail: item.thumbnailUrl,
             },
-          }),
-        ),
-      );
+            }),
+          ),
+        );
+        await this.marketplaceCatalog.recordProductChanges(tx, [productId]);
+        return rows;
+      });
 
       return {
         message: `Successfully created ${created.length} videos`,
@@ -127,19 +139,32 @@ export class ZaloVideoService {
 
   /** Update one active Zalo video. */
   async update(id: number, updateZaloVideoDto: UpdateZaloVideoDto) {
-    await this.findOne(id);
-    return await this.prisma.zaloVideo.update({
-      where: { id },
-      data: updateZaloVideoDto,
+    const existing = await this.findOne(id);
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.zaloVideo.update({
+        where: { id },
+        data: updateZaloVideoDto,
+      });
+      const productIds = [existing.productId, updated.productId].filter(
+        (productId): productId is number => Boolean(productId),
+      );
+      await this.marketplaceCatalog.recordProductChanges(tx, productIds);
+      return updated;
     });
   }
 
   /** Soft-delete one Zalo video and remove its media files. */
   async remove(id: number) {
     const zaloVideo = await this.findOne(id);
-    const removed = await this.prisma.zaloVideo.update({
-      where: { id },
-      data: { isDeleted: 1 },
+    const removed = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.zaloVideo.update({
+        where: { id },
+        data: { isDeleted: 1 },
+      });
+      if (zaloVideo.productId) {
+        await this.marketplaceCatalog.recordProductChanges(tx, [zaloVideo.productId]);
+      }
+      return row;
     });
 
     await this.uploadService.deleteVideo(zaloVideo.videoUrl);

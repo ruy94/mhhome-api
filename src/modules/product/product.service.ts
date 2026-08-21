@@ -3,13 +3,19 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { CreateProductDto } from './dto/create-product.dto.js';
 import { UpdateProductDto } from './dto/update-product.dto.js';
 import { UploadService } from '../upload/upload.service.js';
-import { FlashSaleStatus, PricingMode, Prisma } from '../../generated/prisma/client.js';
+import {
+  FlashSaleStatus,
+  MarketplaceOutboxEventType,
+  PricingMode,
+  Prisma,
+} from '../../generated/prisma/client.js';
 import { mapActiveFlashSale } from '../flash-sale/active-flash-sale.util.js';
 import { Order } from '../../common/dtos/page-options.dto.js';
 import { PageDto } from '../../common/dtos/page.dto.js';
 import { PageMetaDto } from '../../common/dtos/page-meta.dto.js';
 import { ProductQueryDto, ProductSortBy, ProductStockStatus } from './dto/product-query.dto.js';
 import { WebsiteProductQueryDto } from './dto/website-product-query.dto.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
 type ProductListItem = Prisma.ProductGetPayload<{
   include: {
@@ -40,6 +46,7 @@ export class ProductService {
   constructor(
     private prisma: PrismaService,
     private readonly uploadService: UploadService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
   ) {}
 
   async create(data: CreateProductDto) {
@@ -52,8 +59,9 @@ export class ProductService {
     this.validateWholesaleVariants(data.variants, wholesaleEnabled);
     await this.validateWholesaleUsers(this.prisma, wholesaleUserIds);
 
-    return await this.prisma.product.create({
-      data: {
+    return this.prisma.$transaction(async (tx) => {
+      const product = await tx.product.create({
+        data: {
         categoryId: data.categoryId,
         name: data.name,
         detail: data.detail,
@@ -90,11 +98,16 @@ export class ProductService {
             dimensions: variant.dimensions as unknown as Prisma.InputJsonValue,
           })),
         },
-      },
-      include: {
-        variants: true,
-        wholesaleUsers: { select: { userId: true } },
-      },
+        },
+      });
+      await this.marketplaceCatalog.recordProductChanges(tx, [product.id]);
+      return tx.product.findUnique({
+        where: { id: product.id },
+        include: {
+          variants: true,
+          wholesaleUsers: { select: { userId: true } },
+        },
+      });
     });
   }
 
@@ -280,12 +293,19 @@ export class ProductService {
 
   private buildProductOrderBy(
     pageOptionsDto: ProductQueryDto,
-  ): Prisma.ProductOrderByWithRelationInput {
+  ):
+    | Prisma.ProductOrderByWithRelationInput
+    | Prisma.ProductOrderByWithRelationInput[] {
     const order = pageOptionsDto.order ?? Order.DESC;
     const sortBy = this.resolveSortBy(pageOptionsDto);
 
     if (sortBy === ProductSortBy.NAME) return { name: order };
-    if (sortBy === ProductSortBy.SOLD) return { fakeSold: order };
+    if (sortBy === ProductSortBy.SOLD) {
+      return [
+        { fakeSold: { sort: order, nulls: 'last' } },
+        { id: 'asc' },
+      ];
+    }
     return { createdAt: order };
   }
 
@@ -590,6 +610,8 @@ export class ProductService {
         }
       }
 
+      await this.marketplaceCatalog.recordProductChanges(tx, [id]);
+
       // Return kết quả (Chỉ trả về các variant còn active)
       return await tx.product.findUnique({
         where: { id },
@@ -663,10 +685,16 @@ export class ProductService {
       });
 
       // 2. Soft delete Product
-      return await tx.product.update({
+      const deleted = await tx.product.update({
         where: { id },
         data: { isDeleted: 1 },
       });
+      await this.marketplaceCatalog.recordProductChanges(
+        tx,
+        [id],
+        MarketplaceOutboxEventType.ProductDeleted,
+      );
+      return deleted;
     });
   }
 }

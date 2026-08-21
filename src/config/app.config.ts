@@ -7,6 +7,10 @@ export default registerAs('app', () => ({
   logLevel: process.env.LOG_LEVEL ?? 'info',
   features: {
     electronicInvoiceEnabled: process.env.ELECTRONIC_INVOICE_ENABLED === 'true',
+    marketplaceEnabled: process.env.MARKETPLACE_ENABLED === 'true',
+    marketplaceCheckoutEnabled:
+      process.env.MARKETPLACE_ENABLED === 'true' &&
+      process.env.MARKETPLACE_CHECKOUT_ENABLED === 'true',
   },
   jwt: {
     accessSecret: process.env.JWT_ACCESS_SECRET ?? '',

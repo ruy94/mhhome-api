@@ -3,9 +3,10 @@ import { VariantService } from './variant.service.js';
 import { VariantController } from './variant.controller.js';
 import { UploadModule } from '../upload/upload.module.js';
 import { SaleworkIntegrationModule } from '../integrations/salework/salework.module.js';
+import { MarketplaceModule } from '../marketplace/marketplace.module.js';
 
 @Module({
-  imports: [UploadModule, SaleworkIntegrationModule],
+  imports: [UploadModule, SaleworkIntegrationModule, MarketplaceModule],
   controllers: [VariantController],
   providers: [VariantService],
 })

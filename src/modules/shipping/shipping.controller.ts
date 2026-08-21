@@ -26,6 +26,30 @@ export class ShippingController {
     return this.shippingService.createSpxOrder(orderId);
   }
 
+  @Post('marketplace/orders/batch')
+  @RequirePermissions('order:update_tracking')
+  createMarketplaceSpxOrders(@Body() dto: BatchSpxOrdersDto) {
+    return this.shippingService.createMarketplaceSpxOrders(dto.orderIds);
+  }
+
+  @Post('marketplace/orders/awb')
+  @RequirePermissions('order:update_tracking')
+  getMarketplaceAwb(@Body() dto: BatchSpxOrdersDto) {
+    return this.shippingService.getMarketplaceAwb(dto.orderIds);
+  }
+
+  @Post('marketplace/orders/tracking/refresh')
+  @RequirePermissions('order:view')
+  refreshMarketplaceTrackings(@Body() dto: BatchSpxOrdersDto) {
+    return this.shippingService.refreshMarketplaceTrackings(dto.orderIds);
+  }
+
+  @Post('marketplace/orders/:orderId/cancel')
+  @RequirePermissions('order:update_tracking')
+  cancelMarketplaceShippingOrder(@Param('orderId', ParseIntPipe) orderId: number) {
+    return this.shippingService.cancelMarketplaceShippingOrder(orderId);
+  }
+
   @Post('orders/awb')
   @RequirePermissions('order:update_tracking')
   getAwb(@Body() dto: GetShippingAwbDto) {

@@ -19,12 +19,14 @@ export class WebhookReceiverService {
   async handleSionHubEvent(payload: SionHubWebhookPayload): Promise<{ received: true }> {
     this.logger.log(`Received SionHub webhook: ${payload.event}`);
 
+    let shouldEmitBalance = true;
+
     switch (payload.event) {
       case SionHubWebhookEvent.CREDENTIAL_ROTATED:
         await this.handleCredentialRotated(payload.data);
         break;
       case SionHubWebhookEvent.CAMPAIGN_COMPLETED:
-        await this.handleCampaignCompleted(payload.data);
+        shouldEmitBalance = await this.handleCampaignCompleted(payload.data);
         break;
       case SionHubWebhookEvent.ORDER_PAID:
       case SionHubWebhookEvent.SUBSCRIPTION_RENEWED:
@@ -35,7 +37,7 @@ export class WebhookReceiverService {
         break;
     }
 
-    this.emitBalanceIfPresent(payload.data);
+    if (shouldEmitBalance) this.emitBalanceIfPresent(payload.data);
     return { received: true };
   }
 
@@ -48,7 +50,7 @@ export class WebhookReceiverService {
     await this.sionHubCredentials.rotateApiKey(data['apiKey']);
   }
 
-  private async handleCampaignCompleted(data: Record<string, unknown>): Promise<void> {
+  private async handleCampaignCompleted(data: Record<string, unknown>): Promise<boolean> {
     const localCampaignId = this.getNumber(
       data['localCampaignId'] ??
         data['refId'] ??
@@ -57,17 +59,78 @@ export class WebhookReceiverService {
           : undefined),
     );
 
-    if (!localCampaignId) {
+    if (!localCampaignId || !Number.isInteger(localCampaignId) || localCampaignId < 1) {
       this.logger.warn('campaign.completed webhook ignored because localCampaignId is missing');
-      return;
+      return false;
     }
 
-    const success = this.getNumber(data['success']) ?? 0;
-    const failed = this.getNumber(data['failed']) ?? 0;
+    const success = this.getNonNegativeInteger(data['success']);
+    const failed = this.getNonNegativeInteger(data['failed']);
+    const payloadTotal = this.getNonNegativeInteger(data['total']);
     const providerCampaignId = this.getString(data['providerCampaignId']);
-    const finalCost = this.getNumber(data['finalCost'] ?? data['cost']) ?? 0;
+    const finalCost = this.getNonNegativeNumber(data['finalCost'] ?? data['cost']);
     const failReason = this.getString(data['failReason']);
-    const status = this.toCampaignStatus(data['status']);
+
+    if (
+      success === undefined ||
+      failed === undefined ||
+      payloadTotal === undefined ||
+      finalCost === undefined ||
+      !providerCampaignId
+    ) {
+      this.logger.warn(
+        `campaign.completed webhook for campaign #${localCampaignId} ignored because its final snapshot is incomplete`,
+      );
+      return false;
+    }
+
+    const campaign = await this.prisma.campaign.findUnique({
+      where: { id: localCampaignId },
+      select: {
+        total: true,
+        sent: true,
+        success: true,
+        failed: true,
+        cost: true,
+        status: true,
+        providerCampaignId: true,
+      },
+    });
+
+    if (!campaign) {
+      this.logger.warn(
+        `campaign.completed webhook ignored: campaign #${localCampaignId} not found`,
+      );
+      return false;
+    }
+
+    const processed = success + failed;
+    if (payloadTotal !== campaign.total || processed !== campaign.total) {
+      this.logger.warn(
+        `Incomplete campaign.completed snapshot ignored for campaign #${localCampaignId}: ${processed}/${campaign.total}`,
+      );
+      return false;
+    }
+
+    if (campaign.providerCampaignId && campaign.providerCampaignId !== providerCampaignId) {
+      this.logger.warn(
+        `campaign.completed webhook ignored for campaign #${localCampaignId}: provider campaign ID mismatch`,
+      );
+      return false;
+    }
+
+    if (campaign.status === CampaignStatus.COMPLETED) {
+      const isSameSnapshot =
+        campaign.sent === processed &&
+        campaign.success === success &&
+        campaign.failed === failed &&
+        Number(campaign.cost) === finalCost;
+
+      if (!isSameSnapshot) {
+        this.logger.warn(`Conflicting completed snapshot ignored for campaign #${localCampaignId}`);
+      }
+      return isSameSnapshot;
+    }
 
     await this.prisma.campaign.update({
       where: { id: localCampaignId },
@@ -75,14 +138,15 @@ export class WebhookReceiverService {
         ...(providerCampaignId && { providerCampaignId }),
         success,
         failed,
-        sent: success + failed,
-        status,
+        sent: processed,
+        status: CampaignStatus.COMPLETED,
         cost: finalCost,
         failReason,
       },
     });
 
     this.logger.log(`Updated campaign #${localCampaignId} from SionHub webhook`);
+    return true;
   }
 
   private handleBillingEvent(data: Record<string, unknown>): void {
@@ -98,12 +162,6 @@ export class WebhookReceiverService {
     }
   }
 
-  private toCampaignStatus(value: unknown): CampaignStatus {
-    if (value === CampaignStatus.FAILED) return CampaignStatus.FAILED;
-    if (value === CampaignStatus.PROCESSING) return CampaignStatus.PROCESSING;
-    return CampaignStatus.COMPLETED;
-  }
-
   private getNumber(value: unknown): number | undefined {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
     if (typeof value === 'string' && value.trim()) {
@@ -111,6 +169,16 @@ export class WebhookReceiverService {
       if (Number.isFinite(parsed)) return parsed;
     }
     return undefined;
+  }
+
+  private getNonNegativeInteger(value: unknown): number | undefined {
+    const parsed = this.getNumber(value);
+    return parsed !== undefined && Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+  }
+
+  private getNonNegativeNumber(value: unknown): number | undefined {
+    const parsed = this.getNumber(value);
+    return parsed !== undefined && parsed >= 0 ? parsed : undefined;
   }
 
   private getString(value: unknown): string | undefined {

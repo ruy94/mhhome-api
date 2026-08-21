@@ -2,10 +2,14 @@ import { Injectable } from '@nestjs/common';
 
 import { OrderStatus, Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
 @Injectable()
 export class OrderInventoryService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
+  ) {}
 
   async restoreIfFinalCancelled(
     orderId: number,
@@ -32,6 +36,7 @@ export class OrderInventoryService {
         orderProducts: {
           select: {
             variantId: true,
+            productId: true,
             quantity: true,
             flashSaleId: true,
           },
@@ -73,5 +78,12 @@ export class OrderInventoryService {
         data: { sold: Math.max(0, flashSaleItem.sold - item.quantity) },
       });
     }
+
+    await this.marketplaceCatalog.recordProductChanges(
+      tx,
+      order.orderProducts
+        .filter((item) => Boolean(item.variantId))
+        .map((item) => item.productId),
+    );
   }
 }

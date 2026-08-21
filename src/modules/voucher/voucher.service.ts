@@ -77,7 +77,7 @@ export class VoucherService {
     });
 
     const filtered = vouchers.filter((v) => {
-      if (v.usageLimit && v.usedCount >= v.usageLimit) return false;
+      if (v.usageLimit && v.usedCount + v.reservedCount >= v.usageLimit) return false;
       return true;
     });
     const items = pageOptionsDto.take
@@ -115,7 +115,10 @@ export class VoucherService {
       include: { voucherProducts: { select: { productId: true } } },
     });
     if (!voucher) throw new NotFoundException('Không tìm thấy Voucher, hãy kiểm tra lại mã');
-    if (voucher.usageLimit && voucher.usedCount >= voucher.usageLimit) {
+    if (
+      voucher.usageLimit &&
+      voucher.usedCount + voucher.reservedCount >= voucher.usageLimit
+    ) {
       throw new NotFoundException('Voucher đã hết lượt sử dụng');
     }
     return this.serializeVoucher(voucher);
@@ -157,7 +160,7 @@ export class VoucherService {
       .filter((uv) => {
         // Kiểm tra thêm điều kiện usageLimit toàn hệ thống (phòng trường hợp voucher hết lượt dùng chung)
         const v = uv.voucher;
-        if (v.usageLimit !== null && v.usedCount >= v.usageLimit) return false;
+        if (v.usageLimit !== null && v.usedCount + v.reservedCount >= v.usageLimit) return false;
         return true;
       })
       .map((uv) => this.serializeVoucher(uv.voucher));
@@ -195,7 +198,10 @@ export class VoucherService {
 
     // Kiểm tra số lượng phát hành toàn hệ thống (usageLimit)
     // Nếu usageLimit là null nghĩa là không giới hạn
-    if (voucher.usageLimit !== null && voucher.usedCount >= voucher.usageLimit) {
+    if (
+      voucher.usageLimit !== null &&
+      voucher.usedCount + voucher.reservedCount >= voucher.usageLimit
+    ) {
       throw new BadRequestException('Voucher đã hết lượt sử dụng');
     }
 
@@ -396,10 +402,13 @@ export class VoucherService {
   }
 
   private serializeVoucher(voucher: VoucherWithProducts) {
+    const maxDiscountValue = Number(voucher.maxDiscount ?? 0);
+    const maxDiscount =
+      Number.isFinite(maxDiscountValue) && maxDiscountValue > 0 ? maxDiscountValue : null;
     return {
       ...voucher,
       discountValue: Number(voucher.discountValue),
-      maxDiscount: voucher.maxDiscount ? Number(voucher.maxDiscount) : null,
+      maxDiscount,
       minOrderValue: Number(voucher.minOrderValue),
       productIds: voucher.voucherProducts.map((item) => item.productId),
       voucherProducts: undefined,

@@ -1,5 +1,6 @@
 import { Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsBoolean,
@@ -9,6 +10,8 @@ import {
   IsString,
   ValidateNested,
 } from 'class-validator';
+
+export const MAX_CAMPAIGN_RECEIVERS = 4000;
 
 export class CampaignReceiverDto {
   @IsOptional()
@@ -39,6 +42,9 @@ export class CreateCampaignDto {
 
   @IsArray()
   @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_CAMPAIGN_RECEIVERS, {
+    message: 'Mỗi chiến dịch tối đa 4.000 người nhận',
+  })
   @ValidateNested({ each: true })
   @Type(() => CampaignReceiverDto)
   receivers!: CampaignReceiverDto[];

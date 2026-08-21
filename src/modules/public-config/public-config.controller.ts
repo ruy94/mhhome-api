@@ -13,6 +13,11 @@ export class PublicConfigController {
       electronicInvoiceEnabled:
         this.configService.get<boolean>('app.features.electronicInvoiceEnabled') ===
         true,
+      marketplaceEnabled:
+        this.configService.get<boolean>('app.features.marketplaceEnabled') === true,
+      marketplaceCheckoutEnabled:
+        this.configService.get<boolean>('app.features.marketplaceCheckoutEnabled') ===
+        true,
     };
   }
 }

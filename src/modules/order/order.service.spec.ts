@@ -10,7 +10,7 @@ const VoucherType = {
 jest.mock('../../generated/prisma/client.js', () => ({
   ConditionType: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
   DiscountType,
-  OrderPlatform: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website' },
+  OrderPlatform: { ZaloMiniApp: 'ZaloMiniApp', Website: 'Website', Marketplace: 'Marketplace' },
   OrderStatus: { Paid: 'Paid', Refund: 'Refund', Cancel: 'Cancel', Return: 'Return' },
   PricingMode: { Retail: 'Retail', Wholesale: 'Wholesale' },
   PaymentMethod: { COD: 'COD', ZaloPay: 'ZaloPay' },
@@ -23,6 +23,9 @@ jest.mock('../../generated/prisma/client.js', () => ({
   VoucherScope,
   VoucherType,
 }));
+jest.mock('../admin-notification/admin-notification.service.js', () => ({
+  AdminNotificationService: class {},
+}));
 
 import { OrderService } from './order.service.js';
 
@@ -32,9 +35,15 @@ describe('OrderService product item vouchers', () => {
       {} as never,
       {} as never,
       {} as never,
-      { estimateCheckoutDeliveryFee: jest.fn().mockResolvedValue({ deliveryFee: 0, shippingQuote: null }) } as never,
+      {
+        estimateCheckoutDeliveryFee: jest
+          .fn()
+          .mockResolvedValue({ deliveryFee: 0, shippingQuote: null }),
+      } as never,
       {} as never,
       {} as never,
+      { recordProductChanges: jest.fn() } as never,
+      { notifyOrderCreated: jest.fn() } as never,
     );
 
   const createTx = (variants: unknown[], voucher: unknown) =>
@@ -58,6 +67,33 @@ describe('OrderService product item vouchers', () => {
     conditionType: 'ZaloMiniApp',
     voucherProducts: [{ productId: 1 }],
     ...overrides,
+  });
+
+  it('only caps percentage vouchers when max discount is greater than zero', () => {
+    const service = createService();
+    const uncappedVoucher = createProductVoucher({
+      discountType: DiscountType.Percentage,
+      discountValue: 20,
+      maxDiscount: { toString: () => '0' },
+    });
+    const cappedVoucher = createProductVoucher({
+      discountType: DiscountType.Percentage,
+      discountValue: 20,
+      maxDiscount: { toString: () => '10000' },
+    });
+
+    expect(
+      (service as any).calculateVoucherDiscount(uncappedVoucher, 689_000),
+    ).toBe(137_800);
+    expect(
+      (service as any).calculateVoucherDiscount(cappedVoucher, 689_000),
+    ).toBe(10_000);
+    expect((service as any).serializeVoucher(uncappedVoucher)).toMatchObject({
+      maxDiscount: null,
+    });
+    expect((service as any).serializeVoucher(cappedVoucher)).toMatchObject({
+      maxDiscount: 10_000,
+    });
   });
 
   it('applies one product voucher once across all non-flash variants of the product', async () => {
@@ -185,7 +221,6 @@ describe('OrderService product item vouchers', () => {
     );
   });
 
-
   it('applies an order voucher to a retail flash-sale line', async () => {
     const service = createService();
     const tx = createTx(
@@ -263,13 +298,60 @@ describe('OrderService product item vouchers', () => {
       },
     } as never;
 
-    await expect(
-      (service as any).applyProductVoucher(tx, 9, 0, 'ZaloMiniApp'),
-    ).rejects.toThrow('Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ');
+    await expect((service as any).applyProductVoucher(tx, 9, 0, 'ZaloMiniApp')).rejects.toThrow(
+      'Voucher toàn đơn không áp dụng cho sản phẩm bán sỉ',
+    );
   });
 
-});
+  it('atomically rejects local stock already held by another checkout', async () => {
+    const service = createService();
+    const tx = {
+      variant: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+    } as never;
 
+    await expect(
+      (service as any).reserveOrderInventory(tx, [
+        {
+          productId: 1,
+          variantId: 101,
+          quantity: 2,
+          variant: { name: 'Red / M' },
+        },
+      ]),
+    ).rejects.toThrow('Sản phẩm Red / M không đủ tồn kho');
+    expect((tx as any).variant.updateMany).toHaveBeenCalledWith({
+      where: { id: 101, productId: 1, isDeleted: 0, stock: { gte: 2 } },
+      data: { stock: { decrement: 2 } },
+    });
+  });
+
+  it('atomically rejects a flash-sale allocation taken by another checkout', async () => {
+    const service = createService();
+    const tx = {
+      variant: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      flashSaleItem: {
+        findUnique: jest.fn().mockResolvedValue({ id: 7, saleStock: 5 }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    } as never;
+
+    await expect(
+      (service as any).reserveOrderInventory(tx, [
+        {
+          productId: 1,
+          variantId: 101,
+          quantity: 2,
+          flashSaleId: 3,
+          variant: { name: 'Red / M' },
+        },
+      ]),
+    ).rejects.toThrow('Số lượng flash sale không còn đủ');
+    expect((tx as any).flashSaleItem.updateMany).toHaveBeenCalledWith({
+      where: { id: 7, sold: { lte: 3 } },
+      data: { sold: { increment: 2 } },
+    });
+  });
+});
 
 describe('OrderService admin order search', () => {
   const createService = (prisma: Record<string, unknown>) =>
@@ -280,6 +362,8 @@ describe('OrderService admin order search', () => {
       {} as never,
       {} as never,
       {} as never,
+      { recordProductChanges: jest.fn() } as never,
+      { notifyOrderCreated: jest.fn() } as never,
     );
 
   const createOrder = () => ({
@@ -317,7 +401,13 @@ describe('OrderService admin order search', () => {
     };
     const service = createService(prisma);
 
-    const result = await service.findAll({ q: '0901-222', status: 'Paid', page: 1, limit: 20, order: 'desc' } as never);
+    const result = await service.findAll({
+      q: '0901-222',
+      status: 'Paid',
+      page: 1,
+      limit: 20,
+      order: 'desc',
+    } as never);
 
     expect(prisma.address.findMany).toHaveBeenNthCalledWith(1, {
       where: {
@@ -331,10 +421,12 @@ describe('OrderService admin order search', () => {
     });
     expect(prisma.order.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { status: 'Paid', addressId: { in: [20] } },
+        where: expect.objectContaining({ status: 'Paid', addressId: { in: [20] } }),
       }),
     );
-    expect(result.items[0]).toEqual(expect.objectContaining({ id: 10, address: expect.objectContaining({ id: 20 }) }));
+    expect(result.items[0]).toEqual(
+      expect.objectContaining({ id: 10, address: expect.objectContaining({ id: 20 }) }),
+    );
     expect(result.meta.total).toBe(1);
   });
 
@@ -347,7 +439,12 @@ describe('OrderService admin order search', () => {
     };
     const service = createService(prisma);
 
-    const result = await service.findAll({ q: 'khong ton tai', page: 1, limit: 20, order: 'desc' } as never);
+    const result = await service.findAll({
+      q: 'khong ton tai',
+      page: 1,
+      limit: 20,
+      order: 'desc',
+    } as never);
 
     expect(result.items).toEqual([]);
     expect(result.meta.total).toBe(0);

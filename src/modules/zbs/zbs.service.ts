@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  HttpException,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -27,7 +33,6 @@ export interface ChunkResult {
 @Injectable()
 export class ZbsService {
   private readonly logger = new Logger(ZbsService.name);
-  private readonly CHUNK_SIZE = 4000;
   private readonly MAX_SENDS_PER_DAY = 1;
 
   constructor(
@@ -124,49 +129,38 @@ export class ZbsService {
       },
     });
 
-    const chunks: CampaignReceiverDto[][] = [];
-    for (let i = 0; i < totalValid; i += this.CHUNK_SIZE) {
-      chunks.push(validReceivers.slice(i, i + this.CHUNK_SIZE));
-    }
+    let result: SionHubCampaignResult;
+    try {
+      this.logger.log(`Đang gửi chiến dịch ZBS (${validReceivers.length} người nhận)`);
 
-    const results: ChunkResult[] = [];
-    let totalEstimatedCost = 0;
-    let providerCampaignId = '';
+      const rawResult = await this.sionHub.sendCampaign<unknown>({
+        oaId,
+        tenantTemplateId,
+        receivers: validReceivers,
+        metadata: {
+          localCampaignId: campaign.id,
+          refId: campaign.id,
+          campaignName: dto.campaignName,
+        },
+      });
 
-    for (const [index, chunk] of chunks.entries()) {
-      try {
-        this.logger.log(`Đang gửi ZBS chunk ${index + 1}/${chunks.length} (${chunk.length})`);
+      result = this.normalizeCampaignResult(rawResult);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Lỗi tạo chiến dịch ZBS tại SionHub: ${message}`);
 
-        const rawResult = await this.sionHub.sendCampaign<unknown>({
-          oaId,
-          tenantTemplateId,
-          receivers: chunk,
-          metadata: {
-            localCampaignId: campaign.id,
-            refId: campaign.id,
-            campaignName: dto.campaignName,
-          },
-        });
+      await this.markCampaignFailed(campaign.id, message);
 
-        const result = this.normalizeCampaignResult(rawResult);
-        totalEstimatedCost += Number(result.estimatedCost || 0);
-        if (index === 0) providerCampaignId = result.campaignId;
-        results.push({ chunk: index + 1, status: 'success', data: result });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        this.logger.error(`Lỗi gửi ZBS chunk ${index + 1}: ${message}`);
-        results.push({ chunk: index + 1, status: 'failed', error: message });
-      }
+      if (error instanceof HttpException) throw error;
+      throw new BadGatewayException('Không thể tạo chiến dịch tại SionHub');
     }
 
     await this.prisma.campaign.update({
       where: { id: campaign.id },
       data: {
-        providerCampaignId,
-        cost: totalEstimatedCost,
-        status: results.every((result) => result.status === 'failed')
-          ? CampaignStatus.FAILED
-          : CampaignStatus.PROCESSING,
+        providerCampaignId: result.campaignId,
+        status: CampaignStatus.PROCESSING,
+        failReason: null,
       },
     });
 
@@ -178,12 +172,27 @@ export class ZbsService {
     return {
       message: 'Chiến dịch đã được khởi tạo',
       localCampaignId: campaign.id,
-      totalChunks: chunks.length,
+      totalChunks: 1,
       totalValid,
       totalSkipped: skippedReceivers.length,
       skippedList: skippedReceivers,
-      details: results,
+      details: [{ chunk: 1, status: 'success', data: result }] satisfies ChunkResult[],
     };
+  }
+
+  private async markCampaignFailed(campaignId: number, failReason: string): Promise<void> {
+    try {
+      await this.prisma.campaign.update({
+        where: { id: campaignId },
+        data: {
+          status: CampaignStatus.FAILED,
+          failReason,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Không thể đánh dấu campaign #${campaignId} thất bại: ${message}`);
+    }
   }
 
   private buildIdentifiers(phones: string[], uids: string[]): ReceiverIdentifier[] {

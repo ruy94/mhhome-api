@@ -5,7 +5,6 @@ import {
   WebsiteShippingEstimateDto,
 } from './dto/create-order.dto.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { createHash, randomInt } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { UpdateStatusOrderDto } from './dto/update-status-order.dto.js';
 import { UpdateTrackingCodeOrderDto } from './dto/update-tracking-code.dto.js';
@@ -32,6 +31,9 @@ import { ShippingService } from '../shipping/shipping.service.js';
 import type { ShippingEstimateResult } from '../shipping/shipping.types.js';
 import { SaleWorkStockSyncService } from '../salework-sync/salework-stock-sync.service.js';
 import { OrderInventoryService } from '../order-inventory/order-inventory.service.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
+import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
+import { generateOrderCode } from './order-code.js';
 
 const ORDER_VOUCHER_TYPES: VoucherType[] = [
   VoucherType.Normal,
@@ -131,13 +133,12 @@ export class OrderService {
     private shippingService: ShippingService,
     private saleWorkStockSync: SaleWorkStockSyncService,
     private orderInventory: OrderInventoryService,
+    private marketplaceCatalog: MarketplaceCatalogService,
+    private adminNotifications: AdminNotificationService,
   ) {}
 
   private isElectronicInvoiceEnabled() {
-    return (
-      this.configService.get<boolean>('app.features.electronicInvoiceEnabled') ===
-      true
-    );
+    return this.configService.get<boolean>('app.features.electronicInvoiceEnabled') === true;
   }
 
   private normalizeElectronicInvoiceRequest(
@@ -175,9 +176,7 @@ export class OrderService {
       type: invoice.type,
       customerName: invoice.customerName,
       entityName: invoice.entityName,
-      taxCode: taxCode
-        ? `${'*'.repeat(Math.max(0, taxCode.length - 4))}${taxCode.slice(-4)}`
-        : '',
+      taxCode: taxCode ? `${'*'.repeat(Math.max(0, taxCode.length - 4))}${taxCode.slice(-4)}` : '',
       email: emailDomain
         ? `${emailName.slice(0, 2)}${'*'.repeat(Math.max(2, emailName.length - 2))}@${emailDomain}`
         : '',
@@ -185,17 +184,7 @@ export class OrderService {
   }
 
   generateOrderCode(): string {
-    const seed = `${Date.now()}-${process.hrtime.bigint().toString()}-${randomInt(1, 1_000_000_000)}`;
-    const hash = createHash('sha256').update(seed).digest('hex');
-    let digits = hash.replace(/\D/g, '');
-    if (digits.length < 10) {
-      digits += Date.now().toString();
-    }
-    let firstDigit = digits[0];
-    if (firstDigit === '0') {
-      firstDigit = Math.floor(Math.random() * 9 + 1).toString();
-    }
-    return firstDigit + digits.substring(1, 10);
+    return generateOrderCode();
   }
 
   async create(dto: CreateOrderDto) {
@@ -224,6 +213,7 @@ export class OrderService {
         ConditionType.Website,
       );
     });
+    await this.adminNotifications.notifyOrderCreated(order);
     await this.saleWorkStockSync.exportOrderStock(order.id);
     return order;
   }
@@ -322,6 +312,7 @@ export class OrderService {
     const order = await this.prisma.$transaction((tx) =>
       this.createForPlatformTx(tx, dto, platform, voucherConditionType),
     );
+    await this.adminNotifications.notifyOrderCreated(order);
     await this.saleWorkStockSync.exportOrderStock(order.id);
     return order;
   }
@@ -397,24 +388,12 @@ export class OrderService {
     });
 
     // 5. Update Stock & Usage
-    for (const item of orderItems) {
-      // Trừ kho Variant
-      await tx.variant.update({
-        where: { id: item.variantId },
-        data: { stock: { decrement: item.quantity } },
-      });
+    await this.reserveOrderInventory(tx, orderItems);
 
-      // Tăng số lượng đã bán Flash Sale (nếu có)
-      if (item.flashSaleId) {
-        await tx.flashSaleItem.updateMany({
-          where: {
-            flashSaleId: item.flashSaleId,
-            variantId: item.variantId,
-          },
-          data: { sold: { increment: item.quantity } },
-        });
-      }
-    }
+    await this.marketplaceCatalog.recordProductChanges(
+      tx,
+      orderItems.map((item) => item.productId),
+    );
 
     const voucherIdsToConsume = [
       ...quote.itemVouchers.map((item) => item.voucherId),
@@ -427,6 +406,49 @@ export class OrderService {
     }
 
     return order;
+  }
+
+  private async reserveOrderInventory(tx: Prisma.TransactionClient, orderItems: QuotedOrderItem[]) {
+    for (const item of orderItems) {
+      const stock = await tx.variant.updateMany({
+        where: {
+          id: item.variantId,
+          productId: item.productId,
+          isDeleted: 0,
+          stock: { gte: item.quantity },
+        },
+        data: { stock: { decrement: item.quantity } },
+      });
+      if (!stock.count) {
+        throw new BadRequestException(`Sản phẩm ${item.variant.name} không đủ tồn kho`);
+      }
+
+      if (item.flashSaleId) {
+        const flashSaleItem = await tx.flashSaleItem.findUnique({
+          where: {
+            flashSaleId_variantId: {
+              flashSaleId: item.flashSaleId,
+              variantId: item.variantId,
+            },
+          },
+          select: { id: true, saleStock: true },
+        });
+        if (!flashSaleItem) {
+          throw new BadRequestException('Flash sale không còn khả dụng');
+        }
+
+        const flashStock = await tx.flashSaleItem.updateMany({
+          where: {
+            id: flashSaleItem.id,
+            sold: { lte: flashSaleItem.saleStock - item.quantity },
+          },
+          data: { sold: { increment: item.quantity } },
+        });
+        if (!flashStock.count) {
+          throw new BadRequestException('Số lượng flash sale không còn đủ');
+        }
+      }
+    }
   }
 
   private async resolveWebsiteCheckoutDto(
@@ -602,9 +624,8 @@ export class OrderService {
       }
 
       const pricingMode = this.resolveOrderPricingMode(variant, dto.userId);
-      const minOrderQuantity = pricingMode === PricingMode.Wholesale
-        ? variant.wholesaleMinQuantity ?? 1
-        : 1;
+      const minOrderQuantity =
+        pricingMode === PricingMode.Wholesale ? (variant.wholesaleMinQuantity ?? 1) : 1;
 
       if (item.quantity < minOrderQuantity) {
         throw new BadRequestException(
@@ -732,7 +753,6 @@ export class OrderService {
     };
   }
 
-
   private resolveOrderPricingMode(
     variant: Prisma.VariantGetPayload<{
       include: {
@@ -790,7 +810,9 @@ export class OrderService {
         (item) => !item.flashSaleId && item.pricingMode !== PricingMode.Wholesale,
       );
       if (eligibleItems.length === 0) {
-        throw new BadRequestException('Voucher riêng không áp dụng cho sản phẩm đang flash sale hoặc bán sỉ');
+        throw new BadRequestException(
+          'Voucher riêng không áp dụng cho sản phẩm đang flash sale hoặc bán sỉ',
+        );
       }
 
       const eligibleAmount = eligibleItems.reduce(
@@ -858,7 +880,7 @@ export class OrderService {
       throw new BadRequestException('Sản phẩm chưa đủ điều kiện áp dụng voucher riêng');
     }
 
-    if (voucher.usageLimit && voucher.usedCount >= voucher.usageLimit) {
+    if (voucher.usageLimit && voucher.usedCount + voucher.reservedCount >= voucher.usageLimit) {
       throw new BadRequestException('Voucher riêng cho sản phẩm đã hết lượt sử dụng');
     }
 
@@ -874,8 +896,9 @@ export class OrderService {
 
     if (voucher.discountType === DiscountType.Percentage) {
       let discount = amount * (discountValue / 100);
-      if (voucher.maxDiscount) {
-        discount = Math.min(discount, Number(voucher.maxDiscount));
+      const maxDiscount = Number(voucher.maxDiscount ?? 0);
+      if (Number.isFinite(maxDiscount) && maxDiscount > 0) {
+        discount = Math.min(discount, maxDiscount);
       }
       return Math.floor(discount);
     }
@@ -920,10 +943,20 @@ export class OrderService {
       });
     }
 
-    await tx.voucher.update({
-      where: { id: voucherId },
+    const voucher = await tx.voucher.findUniqueOrThrow({ where: { id: voucherId } });
+    const consumed = await tx.voucher.updateMany({
+      where: {
+        id: voucherId,
+        ...(voucher.usageLimit === null
+          ? {}
+          : {
+              usedCount: voucher.usedCount,
+              reservedCount: { lte: voucher.usageLimit - voucher.usedCount - 1 },
+            }),
+      },
       data: { usedCount: { increment: 1 } },
     });
+    if (!consumed.count) throw new BadRequestException('Voucher đã hết lượt sử dụng');
   }
 
   async applyProductVoucher(
@@ -956,7 +989,7 @@ export class OrderService {
       throw new BadRequestException('Đơn hàng chưa đủ điều kiện áp dụng voucher toàn đơn');
     }
 
-    if (voucher.usageLimit && voucher.usedCount >= voucher.usageLimit) {
+    if (voucher.usageLimit && voucher.usedCount + voucher.reservedCount >= voucher.usageLimit) {
       throw new BadRequestException('Voucher toàn đơn đã hết lượt sử dụng');
     }
 
@@ -1007,7 +1040,7 @@ export class OrderService {
       throw new BadRequestException('Đơn hàng chưa đủ điều kiện áp dụng voucher vận chuyển');
     }
 
-    if (voucher.usageLimit && voucher.usedCount >= voucher.usageLimit) {
+    if (voucher.usageLimit && voucher.usedCount + voucher.reservedCount >= voucher.usageLimit) {
       throw new BadRequestException('Voucher vận chuyển đã hết lượt sử dụng');
     }
 
@@ -1021,6 +1054,8 @@ export class OrderService {
   private serializeVoucher(
     voucher: Voucher & { voucherProducts?: { productId: number }[] },
   ): QuoteVoucher {
+    const maxDiscountValue = Number(voucher.maxDiscount ?? 0);
+    const maxDiscount = Number.isFinite(maxDiscountValue) && maxDiscountValue > 0 ? maxDiscountValue : null;
     return {
       id: voucher.id,
       code: voucher.code,
@@ -1029,7 +1064,7 @@ export class OrderService {
       scope: voucher.scope,
       discountType: voucher.discountType,
       discountValue: Number(voucher.discountValue),
-      maxDiscount: voucher.maxDiscount ? Number(voucher.maxDiscount) : null,
+      maxDiscount,
       minOrderValue: Number(voucher.minOrderValue),
       conditionType: voucher.conditionType,
       productIds: voucher.voucherProducts?.map((item) => item.productId) ?? [],
@@ -1133,7 +1168,13 @@ export class OrderService {
     const where: Prisma.OrderWhereInput = {
       ...(pageOptionsDto.status ? { status: pageOptionsDto.status } : {}),
       ...(pageOptionsDto.paymentMethod ? { paymentMethod: pageOptionsDto.paymentMethod } : {}),
-      ...(pageOptionsDto.platform ? { platform: pageOptionsDto.platform } : {}),
+      ...(pageOptionsDto.platform
+        ? { platform: pageOptionsDto.platform }
+        : pageOptionsDto.scope === 'marketplace'
+          ? { platform: OrderPlatform.Marketplace }
+          : pageOptionsDto.scope === 'all'
+            ? {}
+            : { platform: { not: OrderPlatform.Marketplace } }),
     };
 
     if (pageOptionsDto.createdFrom || pageOptionsDto.createdTo) {
@@ -1204,7 +1245,9 @@ export class OrderService {
       return new PageDto([], new PageMetaDto({ itemCount: 0, pageOptionsDto }));
     }
 
-    const userIds = [...new Set(orders.map((o) => o.userId))];
+    const userIds = [
+      ...new Set(orders.map((o) => o.userId).filter((id): id is number => id !== null)),
+    ];
     const users = await this.prisma.user.findMany({
       where: { id: { in: userIds } },
     });
@@ -1218,7 +1261,7 @@ export class OrderService {
 
     const items = orders.map((order) => ({
       ...order,
-      user: userMap.get(order.userId) || null,
+      user: order.userId === null ? null : userMap.get(order.userId) || null,
       address: addressMap.get(order.addressId) || null,
       estAmount: Number(order.estAmount),
       itemVoucherDiscount: Number(order.itemVoucherDiscount),
@@ -1281,7 +1324,9 @@ export class OrderService {
     if (!order) throw new NotFoundException('Order not found');
 
     const [user, addressInOrder] = await Promise.all([
-      this.prisma.user.findUnique({ where: { id: order.userId } }),
+      order.userId === null
+        ? Promise.resolve(null)
+        : this.prisma.user.findUnique({ where: { id: order.userId } }),
       this.prisma.address.findFirst({
         where: {
           id: order.addressId,
@@ -1335,11 +1380,14 @@ export class OrderService {
       },
     });
     if (!order) throw new NotFoundException('Order not found');
+    if (order.platform === OrderPlatform.Marketplace) {
+      throw new BadRequestException(
+        'Đơn hàng liên shop chỉ được cập nhật trạng thái qua Marketplace',
+      );
+    }
 
     const nextStatus =
-      dto.status === OrderStatus.Cancel && order.trackingCode
-        ? OrderStatus.SoftCancel
-        : dto.status;
+      dto.status === OrderStatus.Cancel && order.trackingCode ? OrderStatus.SoftCancel : dto.status;
 
     const updated = await this.prisma.$transaction(async (tx) => {
       const updatedOrder = await tx.order.update({
@@ -1351,7 +1399,12 @@ export class OrderService {
     });
 
     // Tạo commission khi đơn hàng hoàn thành
-    if (nextStatus === OrderStatus.Paid && order.affiliateCode && order.affiliateProductId) {
+    if (
+      nextStatus === OrderStatus.Paid &&
+      order.userId !== null &&
+      order.affiliateCode &&
+      order.affiliateProductId
+    ) {
       await this.affiliateService.createCommission({
         affiliateCode: order.affiliateCode,
         orderId: order.id,
@@ -1368,13 +1421,19 @@ export class OrderService {
 
     // Từ chối commission khi đơn hàng bị hoàn hoặc huỷ
     if (
-      (nextStatus === OrderStatus.Refund || nextStatus === OrderStatus.Cancel || nextStatus === OrderStatus.Return) &&
+      (nextStatus === OrderStatus.Refund ||
+        nextStatus === OrderStatus.Cancel ||
+        nextStatus === OrderStatus.Return) &&
       order.affiliateCode
     ) {
       await this.affiliateService.rejectCommissionByOrder(order.id);
     }
 
-    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(order.id, order.status, nextStatus);
+    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+      order.id,
+      order.status,
+      nextStatus,
+    );
 
     return updated;
   }

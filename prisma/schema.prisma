@@ -29,10 +29,55 @@ model Admin {
 
   roles     AdminRole[]
   campaigns Campaign[]
+  notificationRecipients AdminNotificationRecipient[]
 
   @@map("admins")
 }
 
+enum AdminNotificationSeverity {
+  Info
+  Success
+  Warning
+  Error
+}
+
+enum AdminNotificationDeliveryMode {
+  Inbox
+  Toast
+  InboxAndToast
+}
+
+model AdminNotification {
+  id           String                        @id @default(cuid())
+  type         String                        @db.VarChar(100)
+  title        String                        @db.VarChar(255)
+  content      String                        @db.Text
+  link         String?                       @db.VarChar(500)
+  severity     AdminNotificationSeverity     @default(Info)
+  deliveryMode AdminNotificationDeliveryMode @default(Inbox) @map("delivery_mode")
+  metadata     Json?                         @db.JsonB
+  dedupeKey    String?                       @unique @map("dedupe_key") @db.VarChar(255)
+  createdAt    DateTime                      @default(now()) @map("created_at")
+
+  recipients AdminNotificationRecipient[]
+
+  @@index([createdAt])
+  @@map("admin_notifications")
+}
+
+model AdminNotificationRecipient {
+  notificationId String    @map("notification_id")
+  adminId        String    @map("admin_id")
+  readAt         DateTime? @map("read_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  notification AdminNotification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  admin        Admin             @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@id([notificationId, adminId])
+  @@index([adminId, readAt, createdAt])
+  @@map("admin_notification_recipients")
+}
 model Role {
   id          String  @id @default(cuid())
   name        String  @unique
@@ -140,11 +185,13 @@ model User {
   isGuest         Boolean       @default(false) @map("is_guest")
   isActive        Boolean       @default(true) @map("is_active")
 
-  createdAt    DateTime      @default(now()) @map("created_at")
-  updatedAt    DateTime      @updatedAt @map("updated_at")
-  userVouchers UserVoucher[]
-  cartItems    CartItem[]
-  wholesaleProducts ProductWholesaleUser[]
+  createdAt            DateTime                     @default(now()) @map("created_at")
+  updatedAt            DateTime                     @updatedAt @map("updated_at")
+  userVouchers         UserVoucher[]
+  cartItems            CartItem[]
+  marketplaceCartItems MarketplaceCartItem[]
+  marketplaceIdentity  MarketplaceCustomerIdentity?
+  wholesaleProducts    ProductWholesaleUser[]
 
   addresses Address[]
   affiliate Affiliate?
@@ -188,20 +235,21 @@ model Category {
 }
 
 model Product {
-  id             Int           @id @default(autoincrement())
-  categoryId     Int[]         @map("category_id")
-  name           String        @db.VarChar(255)
-  detail         String        @db.Text()
-  image          String[]      @db.VarChar(255)
-  videoUrl       String?       @map("video_url") @db.VarChar(255)
-  videoThumbnail String?       @map("video_thumbnail") @db.VarChar(255)
-  source         String?       @db.VarChar(255)
-  warranty       Int?
-  warrantyType   WarrantyType? @map("warranty_type")
-  createdAt      DateTime      @default(now()) @map("created_at")
-  fakeSold         Int?    @map("fake_sold")
-  wholesaleEnabled Boolean @default(false) @map("wholesale_enabled")
-  isDeleted        Int     @default(0) @map("is_deleted") @db.SmallInt()
+  id                  Int           @id @default(autoincrement())
+  categoryId          Int[]         @map("category_id")
+  name                String        @db.VarChar(255)
+  detail              String        @db.Text()
+  image               String[]      @db.VarChar(255)
+  videoUrl            String?       @map("video_url") @db.VarChar(255)
+  videoThumbnail      String?       @map("video_thumbnail") @db.VarChar(255)
+  source              String?       @db.VarChar(255)
+  warranty            Int?
+  warrantyType        WarrantyType? @map("warranty_type")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  fakeSold            Int?          @map("fake_sold")
+  wholesaleEnabled    Boolean       @default(false) @map("wholesale_enabled")
+  marketplaceSequence Int           @default(0) @map("marketplace_sequence")
+  isDeleted           Int           @default(0) @map("is_deleted") @db.SmallInt()
 
   tierVariations Json? @map("tier_variations") @db.JsonB
   // "tierVariations": [
@@ -210,14 +258,15 @@ model Product {
   // ]
 
   // Relationship to Variant (one-to-many)
-  variants             Variant[]             @relation("ProductVariants")
+  variants              Variant[]              @relation("ProductVariants")
   // Relationship to Order through OrderProduct
-  orderProducts        OrderProduct[]
-  cartItems            CartItem[]
-  wholesaleUsers       ProductWholesaleUser[]
+  orderProducts         OrderProduct[]
+  cartItems             CartItem[]
+  wholesaleUsers        ProductWholesaleUser[]
   // Relationship to AffiliateCommission
-  affiliateCommissions AffiliateCommission[]
-  voucherProducts      VoucherProduct[]
+  affiliateCommissions  AffiliateCommission[]
+  voucherProducts       VoucherProduct[]
+  marketplaceOutboxLogs MarketplaceOutboxLog[]
 
   @@map("products")
 }
@@ -229,23 +278,23 @@ enum WarrantyType {
 }
 
 model Variant {
-  id            Int      @id @default(autoincrement())
-  productId     Int      @map("product_id")
-  name          String   @db.VarChar(255)
-  image         String?  @db.VarChar(255)
-  basePrice             Decimal? @map("base_price") @db.Decimal(15, 0)
-  originalPrice         Decimal  @map("original_price") @db.Decimal(15, 0)
-  wholesaleBasePrice    Decimal? @map("wholesale_base_price") @db.Decimal(15, 0)
-  wholesalePrice        Decimal? @map("wholesale_price") @db.Decimal(15, 0)
-  wholesaleMinQuantity  Int?     @map("wholesale_min_quantity")
-  packageWeightGrams    Int      @default(300) @map("package_weight_grams")
-  packageLengthCm       Decimal? @map("package_length_cm") @db.Decimal(8, 2)
-  packageWidthCm        Decimal? @map("package_width_cm") @db.Decimal(8, 2)
-  packageHeightCm       Decimal? @map("package_height_cm") @db.Decimal(8, 2)
-  stock                 Int
+  id                   Int      @id @default(autoincrement())
+  productId            Int      @map("product_id")
+  name                 String   @db.VarChar(255)
+  image                String?  @db.VarChar(255)
+  basePrice            Decimal? @map("base_price") @db.Decimal(15, 0)
+  originalPrice        Decimal  @map("original_price") @db.Decimal(15, 0)
+  wholesaleBasePrice   Decimal? @map("wholesale_base_price") @db.Decimal(15, 0)
+  wholesalePrice       Decimal? @map("wholesale_price") @db.Decimal(15, 0)
+  wholesaleMinQuantity Int?     @map("wholesale_min_quantity")
+  packageWeightGrams   Int      @default(300) @map("package_weight_grams")
+  packageLengthCm      Decimal? @map("package_length_cm") @db.Decimal(8, 2)
+  packageWidthCm       Decimal? @map("package_width_cm") @db.Decimal(8, 2)
+  packageHeightCm      Decimal? @map("package_height_cm") @db.Decimal(8, 2)
+  stock                Int
   saleworkProductCode  String?  @map("salework_product_code") @db.VarChar(255)
   saleworkWarehouseId  String?  @map("salework_warehouse_id") @db.VarChar(255)
-  isDeleted     Int      @default(0) @map("is_deleted")
+  isDeleted            Int      @default(0) @map("is_deleted")
 
   dimensions Json? @db.JsonB
   // "dimensions": { "Màu sắc": "Đỏ", "Size": "S" }, // <--- Map chính xác với tierVariations
@@ -253,11 +302,12 @@ model Variant {
   createdAt DateTime @default(now()) @map("created_at")
 
   // Relationship to Product (one-to-many)
-  product        Product         @relation("ProductVariants", fields: [productId], references: [id])
-  orderProducts      OrderProduct[]
-  flashSaleItems     FlashSaleItem[]
-  cartItems          CartItem[]
-  saleWorkOutboxLogs SaleWorkOutboxLog[]
+  product                          Product                           @relation("ProductVariants", fields: [productId], references: [id])
+  orderProducts                    OrderProduct[]
+  flashSaleItems                   FlashSaleItem[]
+  cartItems                        CartItem[]
+  saleWorkOutboxLogs               SaleWorkOutboxLog[]
+  marketplaceInventoryReservations MarketplaceInventoryReservation[]
 
   @@unique([saleworkProductCode, saleworkWarehouseId])
   @@map("variants")
@@ -277,15 +327,15 @@ model ProductWholesaleUser {
 }
 
 model CartItem {
-  id        Int           @id @default(autoincrement())
-  userId    Int           @map("user_id")
-  productId Int           @map("product_id")
-  variantId Int           @map("variant_id")
+  id          Int           @id @default(autoincrement())
+  userId      Int           @map("user_id")
+  productId   Int           @map("product_id")
+  variantId   Int           @map("variant_id")
   quantity    Int           @default(1)
   pricingMode PricingMode   @default(Retail) @map("pricing_mode")
   platform    OrderPlatform @default(ZaloMiniApp)
-  createdAt DateTime      @default(now()) @map("created_at")
-  updatedAt DateTime      @updatedAt @map("updated_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
 
   user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   product Product @relation(fields: [productId], references: [id])
@@ -298,14 +348,48 @@ model CartItem {
   @@map("cart_items")
 }
 
+model MarketplaceCartItem {
+  id              String        @id @default(cuid())
+  userId          Int           @map("user_id")
+  listingId       String        @map("listing_id") @db.Uuid
+  sourceShopId    String        @map("source_shop_id") @db.Uuid
+  sourceShopCode  String        @map("source_shop_code") @db.VarChar(50)
+  sourceShopName  String        @map("source_shop_name") @db.VarChar(255)
+  sourceProductId String        @map("source_product_id") @db.VarChar(100)
+  sourceVariantId String        @map("source_variant_id") @db.VarChar(100)
+  quantity        Int           @default(1)
+  platform        OrderPlatform @default(ZaloMiniApp)
+  productSnapshot Json          @map("product_snapshot") @db.JsonB
+  variantSnapshot Json          @map("variant_snapshot") @db.JsonB
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, listingId, sourceVariantId, platform])
+  @@index([userId, platform])
+  @@index([sourceShopId])
+  @@map("marketplace_cart_items")
+}
+
+model MarketplaceCustomerIdentity {
+  id        String   @id @default(cuid())
+  userId    Int      @unique @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("marketplace_customer_identities")
+}
+
 model OrderProduct {
   id        Int  @id @default(autoincrement())
   orderId   Int  @map("order_id")
   productId Int  @map("product_id")
   variantId Int? @map("variant_id")
 
-  originalPrice Decimal @map("original_price") @db.Decimal(15, 0)
-  finalPrice    Decimal @map("final_price") @db.Decimal(15, 0) // after flash sale
+  originalPrice Decimal     @map("original_price") @db.Decimal(15, 0)
+  finalPrice    Decimal     @map("final_price") @db.Decimal(15, 0) // after flash sale
   quantity      Int
   pricingMode   PricingMode @default(Retail) @map("pricing_mode")
 
@@ -341,7 +425,7 @@ model Order {
   id           Int     @id @default(autoincrement())
   code         String  @unique @db.VarChar(50)
   trackingCode String? @map("tracking_code")
-  userId       Int     @map("user_id")
+  userId       Int?    @map("user_id")
   addressId    Int     @map("address_id")
 
   productVoucherId  Int? @map("product_voucher_id")
@@ -360,12 +444,20 @@ model Order {
   affiliateCode      String? @map("affiliate_code") @db.VarChar(50)
   affiliateProductId Int?    @map("affiliate_product_id")
 
-  status        OrderStatus   @default(Pending)
-  paymentMethod PaymentMethod @default(COD) @map("payment_method")
-  note          String?       @db.VarChar(255)
-  invoiceRequest Json?        @map("invoice_request") @db.JsonB
+  status         OrderStatus   @default(Pending)
+  paymentMethod  PaymentMethod @default(COD) @map("payment_method")
+  note           String?       @db.VarChar(255)
+  invoiceRequest Json?         @map("invoice_request") @db.JsonB
 
   platform OrderPlatform @default(ZaloMiniApp)
+
+  marketplaceParentId      String? @map("marketplace_parent_id")
+  marketplaceSubOrderId    String? @unique @map("marketplace_sub_order_id")
+  marketplaceReservationId String? @unique @map("marketplace_reservation_id")
+  hostShopCode              String? @map("host_shop_code") @db.VarChar(50)
+  opaqueCustomerRef         String? @map("opaque_customer_ref") @db.VarChar(100)
+  recipientSnapshot         Json?   @map("recipient_snapshot") @db.JsonB
+  senderSnapshot            Json?   @map("sender_snapshot") @db.JsonB
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -379,6 +471,7 @@ model Order {
 
   affiliateCommission AffiliateCommission?
   shippingOrders      ShippingOrder[]
+  marketplaceReservation MarketplaceCheckoutReservation?
 
   @@map("orders")
 }
@@ -396,20 +489,25 @@ enum ShippingOrderStatus {
   Cancelled
 }
 
+enum ShippingManagedBy {
+  Local
+  Marketplace
+}
+
 model ShippingBatch {
-  id              Int                 @id @default(autoincrement())
+  id              Int              @id @default(autoincrement())
   provider        ShippingProvider
-  providerBatchNo String?             @unique @map("provider_batch_no") @db.VarChar(80)
-  taskStatus      Int?                @map("task_status")
-  status          String?             @db.VarChar(50)
-  progress        String?             @db.VarChar(30)
-  totalCount      Int?                @map("total_count")
-  successCount    Int?                @map("success_count")
-  failCount       Int?                @map("fail_count")
-  requestPayload  Json?               @map("request_payload") @db.JsonB
-  responsePayload Json?               @map("response_payload") @db.JsonB
-  createdAt       DateTime            @default(now()) @map("created_at")
-  updatedAt       DateTime            @updatedAt @map("updated_at")
+  providerBatchNo String?          @unique @map("provider_batch_no") @db.VarChar(80)
+  taskStatus      Int?             @map("task_status")
+  status          String?          @db.VarChar(50)
+  progress        String?          @db.VarChar(30)
+  totalCount      Int?             @map("total_count")
+  successCount    Int?             @map("success_count")
+  failCount       Int?             @map("fail_count")
+  requestPayload  Json?            @map("request_payload") @db.JsonB
+  responsePayload Json?            @map("response_payload") @db.JsonB
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
 
   shippingOrders ShippingOrder[]
 
@@ -417,30 +515,32 @@ model ShippingBatch {
 }
 
 model ShippingOrder {
-  id              Int                 @id @default(autoincrement())
-  orderId         Int                 @map("order_id")
-  batchId         Int?                @map("batch_id")
-  provider        ShippingProvider
-  status          ShippingOrderStatus @default(Estimated)
-  providerOrderId String?             @map("provider_order_id") @db.VarChar(80)
-  trackingNo                    String?   @map("tracking_no") @db.VarChar(80)
-  trackingLink                  String?   @map("tracking_link") @db.VarChar(255)
-  providerStatus                String?   @map("provider_status") @db.VarChar(100)
-  providerStatusCode            String?   @map("provider_status_code") @db.VarChar(50)
-  trackingSyncedAt              DateTime? @map("tracking_synced_at")
-  estimatedFee                  Decimal?  @map("estimated_fee") @db.Decimal(15, 0)
-  actualFee                     Decimal?  @map("actual_fee") @db.Decimal(15, 0)
-  latestChargeableWeight        Decimal?  @map("latest_chargeable_weight") @db.Decimal(10, 3)
-  latestActualWeight            Decimal?  @map("latest_actual_weight") @db.Decimal(10, 3)
-  latestChargeableParcelLength  Decimal?  @map("latest_chargeable_parcel_length") @db.Decimal(8, 2)
-  latestChargeableParcelWidth   Decimal?  @map("latest_chargeable_parcel_width") @db.Decimal(8, 2)
-  latestChargeableParcelHeight  Decimal?  @map("latest_chargeable_parcel_height") @db.Decimal(8, 2)
-  driverPhoneNumber             String?   @map("driver_phone_number") @db.VarChar(50)
-  requestPayload  Json?               @map("request_payload") @db.JsonB
-  responsePayload Json?               @map("response_payload") @db.JsonB
-  errorMessage    String?             @map("error_message") @db.Text
-  createdAt       DateTime            @default(now()) @map("created_at")
-  updatedAt       DateTime            @updatedAt @map("updated_at")
+  id                           Int                 @id @default(autoincrement())
+  orderId                      Int                 @map("order_id")
+  batchId                      Int?                @map("batch_id")
+  provider                     ShippingProvider
+  status                       ShippingOrderStatus @default(Estimated)
+  managedBy                    ShippingManagedBy   @default(Local) @map("managed_by")
+  marketplaceShipmentId        String?             @unique @map("marketplace_shipment_id")
+  providerOrderId              String?             @map("provider_order_id") @db.VarChar(80)
+  trackingNo                   String?             @map("tracking_no") @db.VarChar(80)
+  trackingLink                 String?             @map("tracking_link") @db.VarChar(255)
+  providerStatus               String?             @map("provider_status") @db.VarChar(100)
+  providerStatusCode           String?             @map("provider_status_code") @db.VarChar(50)
+  trackingSyncedAt             DateTime?           @map("tracking_synced_at")
+  estimatedFee                 Decimal?            @map("estimated_fee") @db.Decimal(15, 0)
+  actualFee                    Decimal?            @map("actual_fee") @db.Decimal(15, 0)
+  latestChargeableWeight       Decimal?            @map("latest_chargeable_weight") @db.Decimal(10, 3)
+  latestActualWeight           Decimal?            @map("latest_actual_weight") @db.Decimal(10, 3)
+  latestChargeableParcelLength Decimal?            @map("latest_chargeable_parcel_length") @db.Decimal(8, 2)
+  latestChargeableParcelWidth  Decimal?            @map("latest_chargeable_parcel_width") @db.Decimal(8, 2)
+  latestChargeableParcelHeight Decimal?            @map("latest_chargeable_parcel_height") @db.Decimal(8, 2)
+  driverPhoneNumber            String?             @map("driver_phone_number") @db.VarChar(50)
+  requestPayload               Json?               @map("request_payload") @db.JsonB
+  responsePayload              Json?               @map("response_payload") @db.JsonB
+  errorMessage                 String?             @map("error_message") @db.Text
+  createdAt                    DateTime            @default(now()) @map("created_at")
+  updatedAt                    DateTime            @updatedAt @map("updated_at")
 
   order  Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
   batch  ShippingBatch?  @relation(fields: [batchId], references: [id])
@@ -449,6 +549,7 @@ model ShippingOrder {
   @@index([orderId])
   @@index([batchId])
   @@index([trackingNo])
+  @@index([managedBy, trackingNo])
   @@map("shipping_orders")
 }
 
@@ -537,9 +638,43 @@ model SaleWorkOutboxLog {
   @@map("salework_outbox_logs")
 }
 
+enum MarketplaceOutboxEventType {
+  ProductUpsert
+  ProductDeleted
+}
+
+enum MarketplaceOutboxStatus {
+  Pending
+  Processing
+  Success
+  Failed
+}
+
+model MarketplaceOutboxLog {
+  id            String                     @id @default(cuid())
+  productId     Int                        @map("product_id")
+  eventType     MarketplaceOutboxEventType @map("event_type")
+  sequence      Int
+  payload       Json                       @db.JsonB
+  status        MarketplaceOutboxStatus    @default(Pending)
+  attemptCount  Int                        @default(0) @map("attempt_count")
+  nextAttemptAt DateTime?                  @map("next_attempt_at")
+  lastError     String?                    @map("last_error") @db.Text
+  processedAt   DateTime?                  @map("processed_at")
+  createdAt     DateTime                   @default(now()) @map("created_at")
+  updatedAt     DateTime                   @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@unique([productId, sequence])
+  @@index([status, nextAttemptAt])
+  @@map("marketplace_outbox_logs")
+}
+
 enum OrderPlatform {
   ZaloMiniApp
   Website
+  Marketplace
 }
 
 model Voucher {
@@ -554,6 +689,7 @@ model Voucher {
   minOrderValue Decimal       @default(0) @map("min_order_value") @db.Decimal(12, 2) // Điều kiện: Tổng đơn hàng tối thiểu để áp dụng
   usageLimit    Int?          @map("usage_limit") // Tổng số lượt sử dụng tối đa của voucher này
   usedCount     Int           @default(0) @map("used_count") // Số lượt đã sử dụng thực tế
+  reservedCount Int           @default(0) @map("reserved_count")
   limitPerUser  Int           @default(1) @map("limit_per_user") // Mỗi khách hàng được dùng tối đa bao nhiêu lần
   validFrom     DateTime      @map("valid_from") // When the voucher becomes valid
   validUntil    DateTime      @map("valid_until") // When the voucher expires
@@ -562,11 +698,12 @@ model Voucher {
   isDeleted     Int           @default(0) @map("is_deleted") @db.SmallInt()
   conditionType ConditionType @default(ZaloMiniApp) @map("condition_type")
 
-  ordersProduct   Order[]          @relation("ProductVoucher")
-  ordersShipping  Order[]          @relation("ShippingVoucher")
-  orderProducts   OrderProduct[]   @relation("OrderProductItemVoucher")
-  userVouchers    UserVoucher[]
-  voucherProducts VoucherProduct[]
+  ordersProduct                  Order[]                         @relation("ProductVoucher")
+  ordersShipping                 Order[]                         @relation("ShippingVoucher")
+  orderProducts                  OrderProduct[]                  @relation("OrderProductItemVoucher")
+  userVouchers                   UserVoucher[]
+  voucherProducts                VoucherProduct[]
+  marketplaceVoucherReservations MarketplaceVoucherReservation[]
 
   @@index([code])
   @@map("vouchers")
@@ -600,12 +737,13 @@ enum ConditionType {
 
 // Bảng trung gian để kiểm soát việc sử dụng voucher của từng User
 model UserVoucher {
-  id        Int       @id @default(autoincrement())
-  userId    Int       @map("user_id")
-  voucherId Int       @map("voucher_id")
-  usedAt    DateTime? @map("used_at") // Thời điểm voucher được sử dụng, null nếu chưa dùng
-  voucher   Voucher   @relation(fields: [voucherId], references: [id])
-  user      User      @relation(fields: [userId], references: [id])
+  id                             Int                             @id @default(autoincrement())
+  userId                         Int                             @map("user_id")
+  voucherId                      Int                             @map("voucher_id")
+  usedAt                         DateTime?                       @map("used_at") // Thời điểm voucher được sử dụng, null nếu chưa dùng
+  voucher                        Voucher                         @relation(fields: [voucherId], references: [id])
+  user                           User                            @relation(fields: [userId], references: [id])
+  marketplaceVoucherReservations MarketplaceVoucherReservation[]
 
   @@map("user_vouchers")
 }
@@ -652,11 +790,107 @@ model FlashSaleItem {
   saleStock       Int          @map("sale_stock") // total flash sale quantity
   sold            Int          @default(0)
 
-  flashSale FlashSale @relation(fields: [flashSaleId], references: [id])
-  variant   Variant   @relation(fields: [variantId], references: [id])
+  flashSale                        FlashSale                         @relation(fields: [flashSaleId], references: [id])
+  variant                          Variant                           @relation(fields: [variantId], references: [id])
+  marketplaceInventoryReservations MarketplaceInventoryReservation[]
 
   @@unique([flashSaleId, variantId])
   @@map("flash_sale_items")
+}
+
+enum MarketplaceReservationStatus {
+  Reserved
+  Confirmed
+  Released
+  Expired
+  Compensated
+  Returned
+  Refunded
+}
+
+model MarketplaceCheckoutReservation {
+  id                   String                            @id @default(cuid())
+  checkoutSessionId    String                            @unique @map("checkout_session_id")
+  hostShopCode         String                            @map("host_shop_code") @db.VarChar(50)
+  hostLocalUserId      Int?                              @map("host_local_user_id")
+  opaqueCustomerRef    String                            @map("opaque_customer_ref") @db.VarChar(100)
+  mode                 String                            @db.VarChar(30)
+  status               MarketplaceReservationStatus      @default(Reserved)
+  expiresAt            DateTime                          @map("expires_at")
+  shippingFee          Decimal                           @map("shipping_fee") @db.Decimal(15, 0)
+  merchandiseSubtotal  Decimal                           @map("merchandise_subtotal") @db.Decimal(15, 0)
+  itemVoucherDiscount  Decimal                           @map("item_voucher_discount") @db.Decimal(15, 0)
+  orderVoucherDiscount Decimal                           @map("order_voucher_discount") @db.Decimal(15, 0)
+  shippingDiscount     Decimal                           @map("shipping_discount") @db.Decimal(15, 0)
+  shippingAmount       Decimal                           @map("shipping_amount") @db.Decimal(15, 0)
+  totalAmount          Decimal                           @map("total_amount") @db.Decimal(15, 0)
+  quoteSnapshot        Json                              @map("quote_snapshot") @db.JsonB
+  confirmedAt          DateTime?                         @map("confirmed_at")
+  releasedAt           DateTime?                         @map("released_at")
+  returnedAt           DateTime?                         @map("returned_at")
+  createdAt            DateTime                          @default(now()) @map("created_at")
+  updatedAt            DateTime                          @updatedAt @map("updated_at")
+  orderId              Int?                              @unique @map("order_id")
+  inventoryItems       MarketplaceInventoryReservation[]
+  vouchers             MarketplaceVoucherReservation[]
+  order                Order?                            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([status, expiresAt])
+  @@map("marketplace_checkout_reservations")
+}
+
+model MarketplaceInventoryReservation {
+  id              String                         @id @default(cuid())
+  reservationId   String                         @map("reservation_id")
+  productId       Int                            @map("product_id")
+  variantId       Int                            @map("variant_id")
+  quantity        Int
+  unitPrice       Decimal                        @map("unit_price") @db.Decimal(15, 0)
+  pricingMode     PricingMode                    @map("pricing_mode")
+  flashSaleItemId Int?                           @map("flash_sale_item_id")
+  itemSnapshot    Json                           @map("item_snapshot") @db.JsonB
+  reservation     MarketplaceCheckoutReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  variant         Variant                        @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  flashSaleItem   FlashSaleItem?                 @relation(fields: [flashSaleItemId], references: [id], onDelete: Restrict)
+
+  @@unique([reservationId, variantId])
+  @@index([variantId])
+  @@map("marketplace_inventory_reservations")
+}
+
+model MarketplaceVoucherReservation {
+  id                    String                         @id @default(cuid())
+  reservationId         String                         @map("reservation_id")
+  voucherId             Int                            @map("voucher_id")
+  userVoucherId         Int?                           @map("user_voucher_id")
+  userVoucherWasCreated Boolean                        @default(false) @map("user_voucher_was_created")
+  sourceProductId       String?                        @map("source_product_id") @db.VarChar(100)
+  scope                 VoucherScope
+  discountAmount        Decimal                        @map("discount_amount") @db.Decimal(15, 0)
+  voucherSnapshot       Json                           @map("voucher_snapshot") @db.JsonB
+  reservation           MarketplaceCheckoutReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  voucher               Voucher                        @relation(fields: [voucherId], references: [id], onDelete: Restrict)
+  userVoucher           UserVoucher?                   @relation(fields: [userVoucherId], references: [id], onDelete: SetNull)
+
+  @@unique([reservationId, voucherId])
+  @@index([voucherId])
+  @@map("marketplace_voucher_reservations")
+}
+
+model MarketplaceIdempotencyRecord {
+  id             String   @id @default(cuid())
+  key            String   @unique @db.VarChar(150)
+  method         String   @db.VarChar(10)
+  path           String   @db.VarChar(500)
+  requestHash    String   @map("request_hash") @db.VarChar(64)
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body") @db.JsonB
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@index([expiresAt])
+  @@map("marketplace_idempotency_records")
 }
 
 model Review {

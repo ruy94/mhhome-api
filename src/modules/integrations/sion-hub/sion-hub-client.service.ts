@@ -1,9 +1,13 @@
 import {
+  BadGatewayException,
   BadRequestException,
+  GatewayTimeoutException,
+  HttpException,
   Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
+  PayloadTooLargeException,
 } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
 
@@ -86,15 +90,20 @@ export class SionHubClientService {
       if (!response.ok) {
         const message = this.extractErrorMessage(payload, response.statusText);
         this.logger.warn(`SionHub ${method} ${path} failed: ${message}`);
+        if (response.status === 413) throw new PayloadTooLargeException(message);
+        if (response.status >= 500) throw new BadGatewayException(message);
         throw new BadRequestException(message);
       }
 
       return this.unwrap<T>(payload);
     } catch (error) {
-      if (error instanceof BadRequestException) throw error;
+      if (error instanceof HttpException) throw error;
       const message = error instanceof Error ? error.message : 'Unable to connect to SionHub';
       this.logger.error(`SionHub ${method} ${path} failed`, message);
-      throw new BadRequestException('Unable to connect to SionHub');
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new GatewayTimeoutException('SionHub không phản hồi trong thời gian cho phép');
+      }
+      throw new BadGatewayException('Unable to connect to SionHub');
     } finally {
       clearTimeout(timeout);
     }

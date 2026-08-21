@@ -7,7 +7,14 @@ import { CreateOrderDto } from '../order/dto/create-order.dto.js';
 import type { QuotedOrderItem } from '../order/order.service.js';
 import { SpxShippingClientService } from '../integrations/shipping/spx/spx-shipping-client.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { OrderStatus, PaymentMethod, Prisma, ShippingOrderStatus, ShippingProvider } from '../../generated/prisma/client.js';
+import {
+  OrderStatus,
+  PaymentMethod,
+  Prisma,
+  ShippingManagedBy,
+  ShippingOrderStatus,
+  ShippingProvider,
+} from '../../generated/prisma/client.js';
 import type {
   ShippingOrderDraft,
   ShippingParcelItem,
@@ -24,6 +31,11 @@ import {
 } from './spx-address-normalizer.js';
 import { SaleWorkStockSyncService } from '../salework-sync/salework-stock-sync.service.js';
 import { OrderInventoryService } from '../order-inventory/order-inventory.service.js';
+import {
+  mapSpxStatusToOrderStatus,
+  SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES,
+} from './spx-status-mapper.js';
+import { MarketplaceClientService } from '../marketplace/marketplace-client.service.js';
 
 const SPX_VN_MAX_PARCEL_WEIGHT_GRAMS = 15_000;
 const SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE =
@@ -39,6 +51,7 @@ export class ShippingService {
     private readonly spxClient: SpxShippingClientService,
     private readonly saleWorkStockSync: SaleWorkStockSyncService,
     private readonly orderInventory: OrderInventoryService,
+    private readonly marketplaceClient: MarketplaceClientService,
   ) {}
 
   isSpxEnabled() {
@@ -102,7 +115,8 @@ export class ShippingService {
 
     const uniqueOrderIds = [...new Set(orderIds)].filter((id) => Number.isInteger(id) && id > 0);
     if (!uniqueOrderIds.length) throw new BadRequestException('Vui lòng chọn ít nhất một đơn hàng');
-    if (uniqueOrderIds.length > 100) throw new BadRequestException('SPX chỉ hỗ trợ tối đa 100 đơn mỗi lần');
+    if (uniqueOrderIds.length > 100)
+      throw new BadRequestException('SPX chỉ hỗ trợ tối đa 100 đơn mỗi lần');
 
     const orders = await this.prisma.order.findMany({
       where: { id: { in: uniqueOrderIds } },
@@ -110,6 +124,7 @@ export class ShippingService {
         shippingOrders: {
           where: {
             provider: ShippingProvider.SPX,
+            managedBy: ShippingManagedBy.Local,
             status: { in: [ShippingOrderStatus.Pending, ShippingOrderStatus.Created] },
           },
           take: 1,
@@ -128,6 +143,9 @@ export class ShippingService {
     }
 
     for (const order of orders) {
+      if (order.marketplaceSubOrderId) {
+        throw new BadRequestException(`Đơn #${order.code} do Marketplace quản lý vận chuyển`);
+      }
       if (order.status !== OrderStatus.Pending) {
         throw new BadRequestException(`Đơn #${order.code} không ở trạng thái chờ xử lý`);
       }
@@ -168,6 +186,7 @@ export class ShippingService {
           orderId: order.id,
           batchId: createdBatch.id,
           provider: ShippingProvider.SPX,
+          managedBy: ShippingManagedBy.Local,
           status: ShippingOrderStatus.Pending,
           providerOrderId: order.code,
           estimatedFee: order.deliveryFee,
@@ -198,13 +217,51 @@ export class ShippingService {
     };
   }
 
+  async createMarketplaceSpxOrders(orderIds: number[]) {
+    const subOrderIds = await this.marketplaceSubOrderIds(orderIds);
+    return (
+      await this.marketplaceClient.createSourceShipments(
+        subOrderIds,
+        `source-shipment:${subOrderIds.join(',')}`,
+      )
+    ).data;
+  }
+
+  async getMarketplaceAwb(orderIds: number[]) {
+    const subOrderIds = await this.marketplaceSubOrderIds(orderIds);
+    return (
+      await this.marketplaceClient.getSourceAwb(
+        subOrderIds,
+        `source-awb:${subOrderIds.join(',')}:${Date.now()}`,
+      )
+    ).data;
+  }
+
+  async refreshMarketplaceTrackings(orderIds: number[]) {
+    const subOrderIds = await this.marketplaceSubOrderIds(orderIds);
+    return (
+      await this.marketplaceClient.refreshSourceShipments(
+        subOrderIds,
+        `source-refresh:${subOrderIds.join(',')}:${Date.now()}`,
+      )
+    ).data;
+  }
+
+  async cancelMarketplaceShippingOrder(orderId: number) {
+    const [subOrderId] = await this.marketplaceSubOrderIds([orderId]);
+    return (
+      await this.marketplaceClient.cancelSourceShipment(
+        subOrderId,
+        `source-cancel:${subOrderId}`,
+      )
+    ).data;
+  }
+
   async getAwbForOrders(input: { orderIds?: number[]; trackingNos?: string[] }) {
     this.assertSpxEnabled();
 
     const trackingNos = new Set(
-      (input.trackingNos ?? [])
-        .map((trackingNo) => trackingNo.trim())
-        .filter(Boolean),
+      (input.trackingNos ?? []).map((trackingNo) => trackingNo.trim()).filter(Boolean),
     );
 
     if (input.orderIds?.length) {
@@ -212,6 +269,7 @@ export class ShippingService {
         where: {
           orderId: { in: input.orderIds },
           provider: ShippingProvider.SPX,
+          managedBy: ShippingManagedBy.Local,
           trackingNo: { not: null },
           status: { not: ShippingOrderStatus.Cancelled },
         },
@@ -223,8 +281,10 @@ export class ShippingService {
     }
 
     const normalizedTrackingNos = [...trackingNos];
-    if (!normalizedTrackingNos.length) throw new BadRequestException('Không có mã vận đơn để in nhãn');
-    if (normalizedTrackingNos.length > 100) throw new BadRequestException('SPX chỉ hỗ trợ tối đa 100 vận đơn mỗi lần');
+    if (!normalizedTrackingNos.length)
+      throw new BadRequestException('Không có mã vận đơn để in nhãn');
+    if (normalizedTrackingNos.length > 100)
+      throw new BadRequestException('SPX chỉ hỗ trợ tối đa 100 vận đơn mỗi lần');
 
     const awb = await this.spxClient.getAwbByTrackingNos(normalizedTrackingNos);
     if (!awb.awbLink) throw new BadRequestException('SPX chưa trả về link nhãn vận đơn');
@@ -238,13 +298,20 @@ export class ShippingService {
       where: { id: orderId },
       include: {
         shippingOrders: {
-          where: { provider: ShippingProvider.SPX, trackingNo: { not: null } },
+          where: {
+            provider: ShippingProvider.SPX,
+            managedBy: ShippingManagedBy.Local,
+            trackingNo: { not: null },
+          },
           orderBy: { createdAt: 'desc' },
           take: 1,
         },
       },
     });
     if (!order) throw new NotFoundException('Order not found');
+    if (order.marketplaceSubOrderId) {
+      throw new BadRequestException('Vận đơn này do Marketplace quản lý');
+    }
 
     const shippingOrder = order.shippingOrders[0];
     if (!shippingOrder?.trackingNo) {
@@ -253,10 +320,19 @@ export class ShippingService {
           where: { id: orderId },
           data: { status: OrderStatus.Cancel },
         });
-        await this.orderInventory.restoreIfFinalCancelled(orderId, order.status, OrderStatus.Cancel, tx);
+        await this.orderInventory.restoreIfFinalCancelled(
+          orderId,
+          order.status,
+          OrderStatus.Cancel,
+          tx,
+        );
         return updatedOrder;
       });
-      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(orderId, order.status, OrderStatus.Cancel);
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+        orderId,
+        order.status,
+        OrderStatus.Cancel,
+      );
       return updated;
     }
 
@@ -289,10 +365,19 @@ export class ShippingService {
         where: { id: orderId },
         data: { status: OrderStatus.Cancel },
       });
-      await this.orderInventory.restoreIfFinalCancelled(orderId, order.status, OrderStatus.Cancel, tx);
+      await this.orderInventory.restoreIfFinalCancelled(
+        orderId,
+        order.status,
+        OrderStatus.Cancel,
+        tx,
+      );
       return updated;
     });
-    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(orderId, order.status, OrderStatus.Cancel);
+    await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+      orderId,
+      order.status,
+      OrderStatus.Cancel,
+    );
     return updatedOrder;
   }
 
@@ -369,7 +454,12 @@ export class ShippingService {
     this.assertSpxEnabled();
 
     const shippingOrder = await this.prisma.shippingOrder.findFirst({
-      where: { orderId, provider: ShippingProvider.SPX, trackingNo: { not: null } },
+      where: {
+        orderId,
+        provider: ShippingProvider.SPX,
+        managedBy: ShippingManagedBy.Local,
+        trackingNo: { not: null },
+      },
       orderBy: { createdAt: 'desc' },
     });
     if (!shippingOrder?.trackingNo) throw new NotFoundException('Đơn hàng chưa có mã vận đơn SPX');
@@ -386,7 +476,6 @@ export class ShippingService {
     });
   }
 
-
   getPickupTimeslots() {
     this.assertSpxEnabled();
     const serviceType = this.configService.get<number>('shipping.spx.serviceType') ?? 1;
@@ -397,7 +486,12 @@ export class ShippingService {
     this.assertSpxEnabled();
 
     const shippingOrder = await this.prisma.shippingOrder.findFirst({
-      where: { orderId, provider: ShippingProvider.SPX, trackingNo: { not: null } },
+      where: {
+        orderId,
+        provider: ShippingProvider.SPX,
+        managedBy: ShippingManagedBy.Local,
+        trackingNo: { not: null },
+      },
       orderBy: { createdAt: 'desc' },
     });
     if (!shippingOrder?.trackingNo) throw new NotFoundException('Đơn hàng chưa có mã vận đơn SPX');
@@ -409,16 +503,25 @@ export class ShippingService {
       where: { id: shippingOrder.orderId },
       select: { status: true },
     });
-    const mappedStatus = this.mapSpxStatusToOrderStatus(track.status, track.statusCode);
+    const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
     const result = await this.prisma.$transaction(async (tx) => {
       const updated = await this.applyTrackOrderResult(tx, shippingOrder.id, track);
       if (previousOrder && mappedStatus) {
-        await this.orderInventory.restoreIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus, tx);
+        await this.orderInventory.restoreIfFinalCancelled(
+          shippingOrder.orderId,
+          previousOrder.status,
+          mappedStatus,
+          tx,
+        );
       }
       return updated;
     });
     if (previousOrder && mappedStatus) {
-      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus);
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+        shippingOrder.orderId,
+        previousOrder.status,
+        mappedStatus,
+      );
     }
     return result;
   }
@@ -432,10 +535,16 @@ export class ShippingService {
     const candidates = await this.prisma.shippingOrder.findMany({
       where: {
         provider: ShippingProvider.SPX,
+        managedBy: ShippingManagedBy.Local,
         trackingNo: { not: null },
         order: {
           status: {
-            in: [OrderStatus.Pending, OrderStatus.Prepare, OrderStatus.Delivering, OrderStatus.SoftCancel],
+            in: [
+              OrderStatus.Pending,
+              OrderStatus.Prepare,
+              OrderStatus.Delivering,
+              OrderStatus.SoftCancel,
+            ],
           },
           ...(uniqueOrderIds ? { id: { in: uniqueOrderIds } } : {}),
         },
@@ -447,7 +556,8 @@ export class ShippingService {
 
     const latestByOrderId = new Map<number, (typeof candidates)[number]>();
     for (const shippingOrder of candidates) {
-      if (!latestByOrderId.has(shippingOrder.orderId)) latestByOrderId.set(shippingOrder.orderId, shippingOrder);
+      if (!latestByOrderId.has(shippingOrder.orderId))
+        latestByOrderId.set(shippingOrder.orderId, shippingOrder);
     }
 
     const shippingOrders = [...latestByOrderId.values()];
@@ -457,8 +567,10 @@ export class ShippingService {
     const trackingToShippingOrder = new Map<string, (typeof shippingOrders)[number]>();
     const providerOrderToShippingOrder = new Map<string, (typeof shippingOrders)[number]>();
     for (const shippingOrder of shippingOrders) {
-      if (shippingOrder.trackingNo) trackingToShippingOrder.set(shippingOrder.trackingNo, shippingOrder);
-      if (shippingOrder.providerOrderId) providerOrderToShippingOrder.set(shippingOrder.providerOrderId, shippingOrder);
+      if (shippingOrder.trackingNo)
+        trackingToShippingOrder.set(shippingOrder.trackingNo, shippingOrder);
+      if (shippingOrder.providerOrderId)
+        providerOrderToShippingOrder.set(shippingOrder.providerOrderId, shippingOrder);
     }
 
     let refreshed = 0;
@@ -481,11 +593,13 @@ export class ShippingService {
       for (const track of tracks) {
         const shippingOrder =
           (track.trackingNo ? trackingToShippingOrder.get(track.trackingNo) : undefined) ??
-          (track.providerOrderId ? providerOrderToShippingOrder.get(track.providerOrderId) : undefined);
+          (track.providerOrderId
+            ? providerOrderToShippingOrder.get(track.providerOrderId)
+            : undefined);
         if (!shippingOrder) continue;
 
         matchedShippingOrderIds.add(shippingOrder.id);
-        const mappedStatus = this.mapSpxStatusToOrderStatus(track.status, track.statusCode);
+        const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
 
         try {
           await this.prisma.$transaction(async (tx) => {
@@ -509,8 +623,11 @@ export class ShippingService {
           refreshed += 1;
         } catch (error) {
           failed += 1;
-          const message = error instanceof Error ? error.message : 'Unable to apply SPX tracking result';
-          this.logger.warn(`SPX tracking apply failed for order #${shippingOrder.orderId}: ${message}`);
+          const message =
+            error instanceof Error ? error.message : 'Unable to apply SPX tracking result';
+          this.logger.warn(
+            `SPX tracking apply failed for order #${shippingOrder.orderId}: ${message}`,
+          );
         }
       }
 
@@ -527,7 +644,12 @@ export class ShippingService {
     this.assertSpxEnabled();
 
     const shippingOrder = await this.prisma.shippingOrder.findFirst({
-      where: { orderId, provider: ShippingProvider.SPX, trackingNo: { not: null } },
+      where: {
+        orderId,
+        provider: ShippingProvider.SPX,
+        managedBy: ShippingManagedBy.Local,
+        trackingNo: { not: null },
+      },
       orderBy: { createdAt: 'desc' },
     });
     if (!shippingOrder?.trackingNo) throw new NotFoundException('Đơn hàng chưa có mã vận đơn SPX');
@@ -593,9 +715,13 @@ export class ShippingService {
       const allResolved =
         shippingOrders.length > 0 &&
         shippingOrders.every((shippingOrder) =>
-          ([ShippingOrderStatus.Created, ShippingOrderStatus.Failed, ShippingOrderStatus.Cancelled] as ShippingOrderStatus[]).includes(
-            shippingOrder.status,
-          ),
+          (
+            [
+              ShippingOrderStatus.Created,
+              ShippingOrderStatus.Failed,
+              ShippingOrderStatus.Cancelled,
+            ] as ShippingOrderStatus[]
+          ).includes(shippingOrder.status),
         );
 
       if (hasTracking || allResolved) return result;
@@ -608,14 +734,43 @@ export class ShippingService {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  private async marketplaceSubOrderIds(orderIds: number[]) {
+    const uniqueOrderIds = [...new Set(orderIds)].filter(
+      (id) => Number.isInteger(id) && id > 0,
+    );
+    if (!uniqueOrderIds.length) {
+      throw new BadRequestException('Vui lòng chọn ít nhất một đơn hàng mua chéo');
+    }
+    if (uniqueOrderIds.length > 100) {
+      throw new BadRequestException('Chỉ hỗ trợ tối đa 100 đơn mỗi lần');
+    }
+    const orders = await this.prisma.order.findMany({
+      where: { id: { in: uniqueOrderIds } },
+      select: { id: true, code: true, marketplaceSubOrderId: true },
+    });
+    if (orders.length !== uniqueOrderIds.length) {
+      throw new NotFoundException('Một số đơn hàng không tồn tại');
+    }
+    const byId = new Map(orders.map((order) => [order.id, order]));
+    return uniqueOrderIds.map((orderId) => {
+      const order = byId.get(orderId);
+      if (!order?.marketplaceSubOrderId) {
+        throw new BadRequestException(`Đơn #${order?.code ?? orderId} không phải đơn mua chéo`);
+      }
+      return order.marketplaceSubOrderId;
+    });
+  }
+
   private async applySpxWebhookPayload(eventType: string, payload: Record<string, unknown>) {
     if (payload.batch_no !== undefined && payload.task_status !== undefined) {
       await this.applyBatchWebhook(payload);
       return;
     }
 
-    const trackingNo = this.asString(payload.tracking_no) ?? this.asString(payload.forward_tracking_no);
-    const providerOrderId = this.asString(payload.order_id) ?? this.asString(payload.customer_order_id);
+    const trackingNo =
+      this.asString(payload.tracking_no) ?? this.asString(payload.forward_tracking_no);
+    const providerOrderId =
+      this.asString(payload.order_id) ?? this.asString(payload.customer_order_id);
 
     if (trackingNo || providerOrderId) {
       await this.applyShippingPayload(eventType, payload, trackingNo, providerOrderId);
@@ -646,11 +801,17 @@ export class ShippingService {
     trackingNo?: string,
     providerOrderId?: string,
   ) {
-    const shippingOrder = await this.findShippingOrderForProviderPayload(trackingNo, providerOrderId);
+    const shippingOrder = await this.findShippingOrderForProviderPayload(
+      trackingNo,
+      providerOrderId,
+    );
     const previousOrder = shippingOrder
-      ? await this.prisma.order.findUnique({ where: { id: shippingOrder.orderId }, select: { status: true } })
+      ? await this.prisma.order.findUnique({
+          where: { id: shippingOrder.orderId },
+          select: { status: true },
+        })
       : null;
-    const mappedStatus = this.mapSpxStatusToOrderStatus(
+    const mappedStatus = mapSpxStatusToOrderStatus(
       this.asString(payload.status),
       this.asString(payload.status_code),
     );
@@ -661,9 +822,15 @@ export class ShippingService {
           where: { id: shippingOrder.id },
           data: {
             ...(trackingNo ? { trackingNo } : {}),
-            ...(this.asString(payload.tracking_link) ? { trackingLink: this.asString(payload.tracking_link) } : {}),
-            ...(this.asString(payload.status) ? { providerStatus: this.asString(payload.status) } : {}),
-            ...(this.asString(payload.status_code) ? { providerStatusCode: this.asString(payload.status_code) } : {}),
+            ...(this.asString(payload.tracking_link)
+              ? { trackingLink: this.asString(payload.tracking_link) }
+              : {}),
+            ...(this.asString(payload.status)
+              ? { providerStatus: this.asString(payload.status) }
+              : {}),
+            ...(this.asString(payload.status_code)
+              ? { providerStatusCode: this.asString(payload.status_code) }
+              : {}),
             trackingSyncedAt: new Date(),
             ...(this.asNumber(payload.latest_shipping_fee) !== undefined
               ? { actualFee: Math.round(this.asNumber(payload.latest_shipping_fee) ?? 0) }
@@ -675,13 +842,25 @@ export class ShippingService {
               ? { latestActualWeight: this.asNumber(payload.latest_actual_weight) }
               : {}),
             ...(this.asNumber(payload.latest_chargeable_parcel_length) !== undefined
-              ? { latestChargeableParcelLength: this.asNumber(payload.latest_chargeable_parcel_length) }
+              ? {
+                  latestChargeableParcelLength: this.asNumber(
+                    payload.latest_chargeable_parcel_length,
+                  ),
+                }
               : {}),
             ...(this.asNumber(payload.latest_chargeable_parcel_width) !== undefined
-              ? { latestChargeableParcelWidth: this.asNumber(payload.latest_chargeable_parcel_width) }
+              ? {
+                  latestChargeableParcelWidth: this.asNumber(
+                    payload.latest_chargeable_parcel_width,
+                  ),
+                }
               : {}),
             ...(this.asNumber(payload.latest_chargeable_parcel_height) !== undefined
-              ? { latestChargeableParcelHeight: this.asNumber(payload.latest_chargeable_parcel_height) }
+              ? {
+                  latestChargeableParcelHeight: this.asNumber(
+                    payload.latest_chargeable_parcel_height,
+                  ),
+                }
               : {}),
             ...(this.asString(payload.driver_phone_number)
               ? { driverPhoneNumber: this.asString(payload.driver_phone_number) }
@@ -694,7 +873,15 @@ export class ShippingService {
           await tx.order.updateMany({
             where: {
               id: shippingOrder.orderId,
-              ...(mappedStatus === OrderStatus.Cancel || mappedStatus === OrderStatus.Return ? {} : { status: { not: OrderStatus.SoftCancel } }),
+              ...(mappedStatus &&
+              mappedStatus !== OrderStatus.Cancel &&
+              mappedStatus !== OrderStatus.Return
+                ? {
+                    status: {
+                      notIn: SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES,
+                    },
+                  }
+                : {}),
             },
             data: {
               ...(trackingNo ? { trackingCode: trackingNo } : {}),
@@ -704,7 +891,12 @@ export class ShippingService {
         }
 
         if (previousOrder && mappedStatus) {
-          await this.orderInventory.restoreIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus, tx);
+          await this.orderInventory.restoreIfFinalCancelled(
+            shippingOrder.orderId,
+            previousOrder.status,
+            mappedStatus,
+            tx,
+          );
         }
       }
 
@@ -731,7 +923,11 @@ export class ShippingService {
     });
 
     if (shippingOrder && previousOrder && mappedStatus) {
-      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(shippingOrder.orderId, previousOrder.status, mappedStatus);
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+        shippingOrder.orderId,
+        previousOrder.status,
+        mappedStatus,
+      );
     }
   }
 
@@ -752,12 +948,20 @@ export class ShippingService {
       },
     });
 
-    const mappedStatus = this.mapSpxStatusToOrderStatus(track.status, track.statusCode);
+    const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
     if (track.trackingNo || mappedStatus) {
       await tx.order.updateMany({
         where: {
           id: updated.orderId,
-          ...(mappedStatus === OrderStatus.Cancel || mappedStatus === OrderStatus.Return ? {} : { status: { not: OrderStatus.SoftCancel } }),
+          ...(mappedStatus &&
+          mappedStatus !== OrderStatus.Cancel &&
+          mappedStatus !== OrderStatus.Return
+            ? {
+                status: {
+                  notIn: SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES,
+                },
+              }
+            : {}),
         },
         data: {
           ...(track.trackingNo ? { trackingCode: track.trackingNo } : {}),
@@ -797,6 +1001,7 @@ export class ShippingService {
     return this.prisma.shippingOrder.findFirst({
       where: {
         provider: ShippingProvider.SPX,
+        managedBy: ShippingManagedBy.Local,
         OR: [
           ...(trackingNo ? [{ trackingNo }] : []),
           ...(providerOrderId ? [{ providerOrderId }] : []),
@@ -804,41 +1009,6 @@ export class ShippingService {
       },
       orderBy: { createdAt: 'desc' },
     });
-  }
-
-  private mapSpxStatusToOrderStatus(status?: string, statusCode?: string) {
-    const value = `${statusCode ?? ''} ${status ?? ''}`.toLowerCase();
-    if (!value.trim()) return undefined;
-
-    if (
-      value.includes('6001') ||
-      value.includes('return') ||
-      value.includes('rts')
-    ) {
-      return OrderStatus.Return;
-    }
-    if (value.includes('cancel')) return OrderStatus.Cancel;
-    if (value.includes('delivered') || value.includes('delivery done') || value.includes('completed')) {
-      return OrderStatus.Paid;
-    }
-    if (value.includes('out for delivery') || value.includes('delivering')) {
-      return OrderStatus.Delivering;
-    }
-    if (
-      value.includes('pickup') ||
-      value.includes('picked') ||
-      value.includes('collect') ||
-      value.includes('transport') ||
-      value.includes('transit') ||
-      value.includes('sorting') ||
-      value.includes('handover') ||
-      value.includes('inbound') ||
-      value.includes('outbound')
-    ) {
-      return OrderStatus.Prepare;
-    }
-
-    return undefined;
   }
 
   private async buildDraftFromCheckout(
@@ -849,14 +1019,23 @@ export class ShippingService {
     payableAmountBeforeDelivery: number,
   ): Promise<ShippingOrderDraft> {
     const recipient = await this.resolveRecipient(tx, dto, dto.paymentMethod);
-    return this.buildDraft(orderId, dto.paymentMethod, dto.note, quoteItems, recipient, payableAmountBeforeDelivery);
+    return this.buildDraft(
+      orderId,
+      dto.paymentMethod,
+      dto.note,
+      quoteItems,
+      recipient,
+      payableAmountBeforeDelivery,
+    );
   }
 
   private buildDraftFromOrder(
     order: Prisma.OrderGetPayload<{
       include: {
         shippingOrders: true;
-        orderProducts: { include: { product: { select: { id: true; name: true; image: true } }; variant: true } };
+        orderProducts: {
+          include: { product: { select: { id: true; name: true; image: true } }; variant: true };
+        };
       };
     }>,
     address: {
@@ -889,9 +1068,13 @@ export class ShippingService {
           pricingMode: item.pricingMode,
           minOrderQuantity: 1,
           packageWeightGrams: item.variant.packageWeightGrams,
-          packageLengthCm: item.variant.packageLengthCm ? Number(item.variant.packageLengthCm) : null,
+          packageLengthCm: item.variant.packageLengthCm
+            ? Number(item.variant.packageLengthCm)
+            : null,
           packageWidthCm: item.variant.packageWidthCm ? Number(item.variant.packageWidthCm) : null,
-          packageHeightCm: item.variant.packageHeightCm ? Number(item.variant.packageHeightCm) : null,
+          packageHeightCm: item.variant.packageHeightCm
+            ? Number(item.variant.packageHeightCm)
+            : null,
         },
       };
     });
@@ -915,14 +1098,18 @@ export class ShippingService {
     payableAmount: number,
   ): ShippingOrderDraft {
     const parcel = this.buildParcel(quoteItems);
-    const codAmount = paymentMethod === PaymentMethod.COD ? Math.max(Math.round(payableAmount), 0) : 0;
+    const codAmount =
+      paymentMethod === PaymentMethod.COD ? Math.max(Math.round(payableAmount), 0) : 0;
     const collectType = this.configService.get<number>('shipping.spx.collectType') ?? 2;
     const pickupTime = this.configService.get<number>('shipping.spx.pickupTime');
     const pickupTimeRangeId = this.configService.get<number>('shipping.spx.pickupTimeRangeId');
-    const pickupTimeRange = this.configService.get<string>('shipping.spx.pickupTimeRange') || undefined;
+    const pickupTimeRange =
+      this.configService.get<string>('shipping.spx.pickupTimeRange') || undefined;
 
     if (collectType === 1 && (!pickupTime || !pickupTimeRangeId || !pickupTimeRange)) {
-      throw new BadRequestException('SPX pickup cần cấu hình pickup_time, pickup_time_range_id và pickup_time_range');
+      throw new BadRequestException(
+        'SPX pickup cần cấu hình pickup_time, pickup_time_range_id và pickup_time_range',
+      );
     }
 
     return {
@@ -947,7 +1134,9 @@ export class ShippingService {
     const parcelItems: ShippingParcelItem[] = quoteItems.map((item) => {
       const weight = item.variant.packageWeightGrams ?? 0;
       if (!Number.isFinite(weight) || weight <= 0) {
-        throw new BadRequestException(`Biến thể ${item.variant.name} chưa có trọng lượng vận chuyển hợp lệ`);
+        throw new BadRequestException(
+          `Biến thể ${item.variant.name} chưa có trọng lượng vận chuyển hợp lệ`,
+        );
       }
 
       return {
@@ -960,15 +1149,24 @@ export class ShippingService {
       };
     });
 
-    const totalWeight = parcelItems.reduce((sum, item) => sum + item.weightGrams * item.quantity, 0);
+    const totalWeight = parcelItems.reduce(
+      (sum, item) => sum + item.weightGrams * item.quantity,
+      0,
+    );
     const totalQuantity = quoteItems.reduce((sum, item) => sum + item.quantity, 0);
     if (totalWeight > SPX_VN_MAX_PARCEL_WEIGHT_GRAMS) {
       throw new BadRequestException(SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE);
     }
 
-    const lengthCm = this.maxOptionalDimension(quoteItems.map((item) => item.variant.packageLengthCm));
-    const widthCm = this.maxOptionalDimension(quoteItems.map((item) => item.variant.packageWidthCm));
-    const heightCm = this.maxOptionalDimension(quoteItems.map((item) => item.variant.packageHeightCm));
+    const lengthCm = this.maxOptionalDimension(
+      quoteItems.map((item) => item.variant.packageLengthCm),
+    );
+    const widthCm = this.maxOptionalDimension(
+      quoteItems.map((item) => item.variant.packageWidthCm),
+    );
+    const heightCm = this.maxOptionalDimension(
+      quoteItems.map((item) => item.variant.packageHeightCm),
+    );
     if ([lengthCm, widthCm, heightCm].every((value) => value !== undefined)) {
       const sum = (lengthCm ?? 0) + (widthCm ?? 0) + (heightCm ?? 0);
       if (sum > 180 || [lengthCm, widthCm, heightCm].some((value) => (value ?? 0) > 60)) {
@@ -991,24 +1189,37 @@ export class ShippingService {
   private maxOptionalDimension(values: Array<number | null | undefined>) {
     const normalized = values
       .map((value) => (value === null || value === undefined ? undefined : Number(value)))
-      .filter((value): value is number =>
-        value !== undefined && Number.isFinite(value) && value > 0,
+      .filter(
+        (value): value is number => value !== undefined && Number.isFinite(value) && value > 0,
       );
     if (!normalized.length) return undefined;
     return Math.max(...normalized);
   }
 
-  private async resolveRecipient(tx: Prisma.TransactionClient, dto: CreateOrderDto, paymentMethod?: PaymentMethod) {
+  private async resolveRecipient(
+    tx: Prisma.TransactionClient,
+    dto: CreateOrderDto,
+    paymentMethod?: PaymentMethod,
+  ) {
     if (dto.address) return this.mapCheckoutAddressToParty(dto.address, paymentMethod);
-    if (!dto.addressId) throw new BadRequestException('Thiếu địa chỉ giao hàng để tính phí vận chuyển');
+    if (!dto.addressId)
+      throw new BadRequestException('Thiếu địa chỉ giao hàng để tính phí vận chuyển');
 
     const address = await tx.address.findFirst({ where: { id: dto.addressId, isDeleted: 0 } });
     if (!address) throw new BadRequestException('Không tìm thấy địa chỉ giao hàng');
     return this.mapAddressToParty(address, paymentMethod);
   }
 
-  private mapCheckoutAddressToParty(address: NonNullable<CreateOrderDto['address']>, paymentMethod?: PaymentMethod): ShippingParty {
-    const normalized = this.normalizeRecipientAddress(address.city, address.district, address.ward, paymentMethod);
+  private mapCheckoutAddressToParty(
+    address: NonNullable<CreateOrderDto['address']>,
+    paymentMethod?: PaymentMethod,
+  ): ShippingParty {
+    const normalized = this.normalizeRecipientAddress(
+      address.city,
+      address.district,
+      address.ward,
+      paymentMethod,
+    );
     return {
       name: address.cneeName,
       phone: address.cneePhone,
@@ -1023,15 +1234,23 @@ export class ShippingService {
     };
   }
 
-  private mapAddressToParty(address: {
-    cneeName: string | null;
-    cneePhone: string | null;
-    city: string | null;
-    district: string | null;
-    ward: string | null;
-    fullAddr: string | null;
-  }, paymentMethod?: PaymentMethod): ShippingParty {
-    const normalized = this.normalizeRecipientAddress(address.city, address.district, address.ward, paymentMethod);
+  private mapAddressToParty(
+    address: {
+      cneeName: string | null;
+      cneePhone: string | null;
+      city: string | null;
+      district: string | null;
+      ward: string | null;
+      fullAddr: string | null;
+    },
+    paymentMethod?: PaymentMethod,
+  ): ShippingParty {
+    const normalized = this.normalizeRecipientAddress(
+      address.city,
+      address.district,
+      address.ward,
+      paymentMethod,
+    );
     return {
       name: address.cneeName ?? '',
       phone: address.cneePhone ?? '',
@@ -1067,7 +1286,8 @@ export class ShippingService {
 
   private resolveSender(): ShippingParty {
     const sender = this.configService.get<ShippingParty>('shipping.spx.sender');
-    const addressVersion = this.configService.get<number>('shipping.spx.addressVersion') === 2 ? 2 : 0;
+    const addressVersion =
+      this.configService.get<number>('shipping.spx.addressVersion') === 2 ? 2 : 0;
     const collectType = this.configService.get<number>('shipping.spx.collectType') ?? 2;
 
     if (!sender?.name || !sender.phone || !sender.state || !sender.city || !sender.detailAddress) {
@@ -1077,7 +1297,9 @@ export class ShippingService {
     if (addressVersion === 2) {
       const normalized = normalizeSpxSenderAddress(sender.state, sender.city);
       if (!normalized) {
-        throw new BadRequestException('Địa chỉ gửi hàng SPX đã cũ, vui lòng cập nhật lại địa chỉ mới.');
+        throw new BadRequestException(
+          'Địa chỉ gửi hàng SPX đã cũ, vui lòng cập nhật lại địa chỉ mới.',
+        );
       }
       if (collectType === 1 && !normalized.pickupAvailable) {
         throw new BadRequestException(SPX_PICKUP_UNAVAILABLE_MESSAGE);

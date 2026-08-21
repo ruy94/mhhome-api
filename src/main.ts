@@ -8,6 +8,7 @@ import cookieParser from 'cookie-parser';
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { WINSTON_MODULE_NEST_PROVIDER } from 'nest-winston';
@@ -15,7 +16,7 @@ import { WINSTON_MODULE_NEST_PROVIDER } from 'nest-winston';
 import { AppModule } from './app.module.js';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     // bufferLogs: true để Winston kịp khởi động trước khi log được xuất ra
     bufferLogs: true,
     rawBody: true, // Cần cho webhook signature verification
@@ -26,6 +27,10 @@ async function bootstrap(): Promise<void> {
 
   const configService = app.get(ConfigService);
   const apiPrefix = configService.get<string>('app.apiPrefix') ?? 'api/v1';
+  const jsonBodyLimitBytes =
+    configService.get<number>('HTTP_JSON_BODY_LIMIT_BYTES') ?? 10 * 1024 * 1024;
+
+  app.useBodyParser('json', { limit: jsonBodyLimitBytes });
 
   const corsOrigins = (process.env['CORS_ORIGINS'] ?? 'http://localhost:3000,http://localhost:4000')
     .split(',')

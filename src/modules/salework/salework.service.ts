@@ -19,12 +19,15 @@ import type { CreateSaleworkDebtDto, GenerateSaleworkQrDto } from './dto/salewor
 import type { SaleworkInventoryTransactionDto } from './dto/salework-inventory-transaction.dto.js';
 import type { SaleworkProductReportDto } from './dto/salework-report.dto.js';
 import type { SaleworkWarehouseTransactionDto } from './dto/salework-warehouse.dto.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
+import { MarketplaceReservationStatus } from '../../generated/prisma/enums.js';
 
 @Injectable()
 export class SaleworkService {
   constructor(
     private readonly saleworkClient: SaleworkClientService,
     private readonly prisma: PrismaService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
   ) {}
 
   getProducts(): Promise<SaleworkProductsData> {
@@ -41,6 +44,7 @@ export class SaleworkService {
       },
       select: {
         id: true,
+        productId: true,
         saleworkProductCode: true,
         saleworkWarehouseId: true,
       },
@@ -53,6 +57,17 @@ export class SaleworkService {
       saleworkStock: number;
       appliedStock: number;
     }> = [];
+    const activeReservations = await this.prisma.marketplaceInventoryReservation.groupBy({
+      by: ['variantId'],
+      where: {
+        variantId: { in: variants.map((variant) => variant.id) },
+        reservation: { status: MarketplaceReservationStatus.Reserved },
+      },
+      _sum: { quantity: true },
+    });
+    const reservedByVariant = new Map(
+      activeReservations.map((item) => [item.variantId, item._sum.quantity ?? 0]),
+    );
     const skippedItems: Array<{
       variantId: number;
       saleworkProductCode: string;
@@ -77,11 +92,7 @@ export class SaleworkService {
         continue;
       }
 
-      const appliedStock = Math.max(0, saleworkStock);
-      await this.prisma.variant.update({
-        where: { id: variant.id },
-        data: { stock: appliedStock },
-      });
+      const appliedStock = saleworkStock - (reservedByVariant.get(variant.id) ?? 0);
       items.push({
         variantId: variant.id,
         saleworkProductCode,
@@ -90,6 +101,22 @@ export class SaleworkService {
         appliedStock,
       });
     }
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        await tx.variant.update({
+          where: { id: item.variantId },
+          data: { stock: item.appliedStock },
+        });
+      }
+      const updatedIds = new Set(items.map((item) => item.variantId));
+      await this.marketplaceCatalog.recordProductChanges(
+        tx,
+        variants
+          .filter((variant) => updatedIds.has(variant.id))
+          .map((variant) => variant.productId),
+      );
+    });
 
     return {
       totalLinked: variants.length,
@@ -152,4 +179,3 @@ export class SaleworkService {
     return this.saleworkClient.generateQr(dto);
   }
 }
-

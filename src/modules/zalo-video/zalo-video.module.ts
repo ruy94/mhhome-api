@@ -4,9 +4,10 @@ import { ZaloVideoService } from './zalo-video.service.js';
 import { ZaloVideoController } from './zalo-video.controller.js';
 import { MiniappZaloVideoController } from './miniapp-zalo-video.controller.js';
 import { WebsiteZaloVideoController } from './website-zalo-video.controller.js';
+import { MarketplaceModule } from '../marketplace/marketplace.module.js';
 
 @Module({
-  imports: [UploadModule],
+  imports: [UploadModule, MarketplaceModule],
   controllers: [ZaloVideoController, MiniappZaloVideoController, WebsiteZaloVideoController],
   providers: [ZaloVideoService],
   exports: [ZaloVideoService],

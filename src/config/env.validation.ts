@@ -6,6 +6,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUUID,
   Min,
   validateSync,
 } from 'class-validator';
@@ -24,6 +25,10 @@ export class EnvironmentVariables {
   @Min(1)
   PORT: number = 3000;
 
+  @IsInt()
+  @Min(1)
+  HTTP_JSON_BODY_LIMIT_BYTES: number = 10 * 1024 * 1024;
+
   @IsString()
   DATABASE_URL!: string;
 
@@ -38,6 +43,11 @@ export class EnvironmentVariables {
   REDIS_PASSWORD?: string;
 
   @IsOptional()
+  @IsInt()
+  @Min(0)
+  REDIS_DB?: number;
+
+  @IsOptional()
   @IsString()
   GEMINI_API_KEY?: string;
 
@@ -48,6 +58,10 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsBoolean()
   ELECTRONIC_INVOICE_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  CORS_ORIGINS?: string;
 
   @IsString()
   ZALO_OA_ID!: string;
@@ -212,11 +226,73 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsString()
   SALEWORK_BANKING_BASE_URL?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  MARKETPLACE_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  MARKETPLACE_CHECKOUT_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_SHOP_CODE?: string;
+
+  @IsOptional()
+  @IsUUID()
+  MARKETPLACE_KEY_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_HMAC_SECRET?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  MARKETPLACE_REQUEST_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  MARKETPLACE_HMAC_MAX_SKEW_SECONDS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  MARKETPLACE_NONCE_TTL_SECONDS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(30)
+  MARKETPLACE_RESERVATION_TTL_SECONDS?: number;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_MEDIA_IMAGE_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_MEDIA_VIDEO_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  MARKETPLACE_MEDIA_THUMBNAIL_BASE_URL?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
   const normalizedConfig = { ...config };
-  const booleanKeys = ['ELECTRONIC_INVOICE_ENABLED', 'SPX_ENABLED', 'SALEWORK_ENABLED'] as const;
+  const booleanKeys = [
+    'ELECTRONIC_INVOICE_ENABLED',
+    'SPX_ENABLED',
+    'SALEWORK_ENABLED',
+    'MARKETPLACE_ENABLED',
+    'MARKETPLACE_CHECKOUT_ENABLED',
+  ] as const;
 
   for (const key of booleanKeys) {
     const value = normalizedConfig[key];
@@ -239,6 +315,35 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
   const errors = validateSync(validated, { skipMissingProperties: false });
   if (errors.length > 0) {
     throw new Error(`Env validation failed:\n${errors.toString()}`);
+  }
+  if (validated.MARKETPLACE_CHECKOUT_ENABLED && !validated.MARKETPLACE_ENABLED) {
+    throw new Error(
+      'Env validation failed:\nMARKETPLACE_CHECKOUT_ENABLED requires MARKETPLACE_ENABLED=true',
+    );
+  }
+  if (validated.MARKETPLACE_ENABLED) {
+    const requiredMarketplaceKeys = [
+      'MARKETPLACE_BASE_URL',
+      'MARKETPLACE_SHOP_CODE',
+      'MARKETPLACE_KEY_ID',
+      'MARKETPLACE_HMAC_SECRET',
+      'MARKETPLACE_MEDIA_IMAGE_BASE_URL',
+      'MARKETPLACE_MEDIA_VIDEO_BASE_URL',
+      'MARKETPLACE_MEDIA_THUMBNAIL_BASE_URL',
+      'SPX_SENDER_NAME',
+      'SPX_SENDER_PHONE',
+      'SPX_SENDER_STATE',
+      'SPX_SENDER_CITY',
+      'SPX_SENDER_DETAIL_ADDRESS',
+    ] as const;
+    const missing = requiredMarketplaceKeys.filter(
+      (key) => !String(validated[key] ?? '').trim(),
+    );
+    if (missing.length) {
+      throw new Error(
+        `Env validation failed:\nMissing Marketplace configuration: ${missing.join(', ')}`,
+      );
+    }
   }
   return validated;
 }

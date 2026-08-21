@@ -2,10 +2,15 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { UpdateVariantDto } from './dto/update-variant.dto.js';
 import { LinkSaleworkVariantDto } from './dto/link-salework-variant.dto.js';
-import { Prisma, FlashSaleStatus } from '../../generated/prisma/client.js';
+import {
+  Prisma,
+  FlashSaleStatus,
+  MarketplaceReservationStatus,
+} from '../../generated/prisma/client.js';
 import { UploadService } from '../upload/upload.service.js';
 import { ConfigService } from '@nestjs/config';
 import { SaleworkClientService } from '../integrations/salework/salework-client.service.js';
+import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
 @Injectable()
 export class VariantService {
@@ -14,6 +19,7 @@ export class VariantService {
     private readonly uploadService: UploadService,
     private readonly configService: ConfigService,
     private readonly saleworkClient: SaleworkClientService,
+    private readonly marketplaceCatalog: MarketplaceCatalogService,
   ) {}
 
   async findOne(id: number) {
@@ -21,7 +27,13 @@ export class VariantService {
       where: { id, isDeleted: 0 },
       include: {
         product: {
-          select: { id: true, name: true, image: true, tierVariations: true, wholesaleEnabled: true },
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            tierVariations: true,
+            wholesaleEnabled: true,
+          },
         },
       },
     });
@@ -36,12 +48,13 @@ export class VariantService {
     });
     if (!variant) throw new NotFoundException('Variant not found');
 
-    return await this.prisma.$transaction(async (tx) => {
+    const nextImage = dto.image === '' ? null : (dto.image ?? variant.image);
+    const updatedVariant = await this.prisma.$transaction(async (tx) => {
       await tx.variant.update({
         where: { id },
         data: {
           name: dto.name,
-          image: dto.image ?? variant.image,
+          image: nextImage,
           basePrice: dto.basePrice,
           originalPrice: dto.originalPrice,
           wholesaleBasePrice: dto.wholesaleBasePrice,
@@ -56,16 +69,17 @@ export class VariantService {
             : undefined,
         },
       });
-      if (dto.image && dto.image !== variant.image) {
-        // Xóa ảnh cũ nếu có ảnh mới
-        await this.uploadService.deleteImage(variant.image || '');
-      }
+      await this.marketplaceCatalog.recordProductChanges(tx, [variant.productId]);
       return await tx.variant.findUnique({
         where: { id },
       });
     });
-  }
 
+    if (variant.image && nextImage !== variant.image) {
+      await this.uploadService.deleteImage(variant.image);
+    }
+    return updatedVariant;
+  }
 
   async linkSalework(id: number, dto: LinkSaleworkVariantDto) {
     const saleworkProductCode = dto.saleworkProductCode.trim();
@@ -90,19 +104,34 @@ export class VariantService {
     if (this.configService.get<boolean>('salework.enabled') === true) {
       const salework = await this.saleworkClient.getProducts();
       const product = salework.products[saleworkProductCode];
-      const hasWarehouse = salework.warehouses.some((warehouse) => warehouse.wid === saleworkWarehouseId);
-      const saleworkStock = product?.stocks?.find((stock) => stock.wid === saleworkWarehouseId)?.value;
+      const hasWarehouse = salework.warehouses.some(
+        (warehouse) => warehouse.wid === saleworkWarehouseId,
+      );
+      const saleworkStock = product?.stocks?.find(
+        (stock) => stock.wid === saleworkWarehouseId,
+      )?.value;
 
       if (!product || !hasWarehouse || saleworkStock === undefined) {
         throw new BadRequestException('SKU hoặc kho SaleWork không hợp lệ');
       }
 
-      updateData.stock = Math.max(0, saleworkStock);
+      const reservations = await this.prisma.marketplaceInventoryReservation.aggregate({
+        where: {
+          variantId: id,
+          reservation: { status: MarketplaceReservationStatus.Reserved },
+        },
+        _sum: { quantity: true },
+      });
+      updateData.stock = saleworkStock - (reservations._sum.quantity ?? 0);
     }
 
-    return this.prisma.variant.update({
-      where: { id },
-      data: updateData,
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.variant.update({
+        where: { id },
+        data: updateData,
+      });
+      await this.marketplaceCatalog.recordProductChanges(tx, [variant.productId]);
+      return updated;
     });
   }
 
@@ -110,9 +139,13 @@ export class VariantService {
     const variant = await this.prisma.variant.findUnique({ where: { id, isDeleted: 0 } });
     if (!variant) throw new NotFoundException('Variant not found');
 
-    return this.prisma.variant.update({
-      where: { id },
-      data: { saleworkProductCode: null, saleworkWarehouseId: null },
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.variant.update({
+        where: { id },
+        data: { saleworkProductCode: null, saleworkWarehouseId: null },
+      });
+      await this.marketplaceCatalog.recordProductChanges(tx, [variant.productId]);
+      return updated;
     });
   }
 
@@ -139,10 +172,12 @@ export class VariantService {
       });
 
       // 2. Soft Delete Variant
-      return await tx.variant.update({
+      const deleted = await tx.variant.update({
         where: { id },
         data: { isDeleted: 1 },
       });
+      await this.marketplaceCatalog.recordProductChanges(tx, [variant.productId]);
+      return deleted;
     });
   }
 }

@@ -31,9 +31,13 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       } else if (typeof body === 'object' && body !== null) {
         const b = body as Record<string, unknown>;
         const raw = b['message'];
-        message = Array.isArray(raw) ? (raw[0] as string) : (raw as string) ?? message;
+        message = Array.isArray(raw) ? (raw[0] as string) : ((raw as string) ?? message);
         error = (b['error'] as string) ?? exception.name;
       }
+    } else if (this.getStatus(exception) === HttpStatus.PAYLOAD_TOO_LARGE) {
+      status = HttpStatus.PAYLOAD_TOO_LARGE;
+      message = 'Dữ liệu gửi lên vượt quá giới hạn cho phép';
+      error = 'Payload Too Large';
     } else {
       const err = exception instanceof Error ? exception : new Error(String(exception));
       this.logger.error(`${request.method} ${request.url}`, err.stack);
@@ -46,5 +50,13 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       timestamp: new Date().toISOString(),
       path: request.url,
     });
+  }
+
+  private getStatus(exception: unknown): number | undefined {
+    if (typeof exception !== 'object' || exception === null) return undefined;
+
+    const value = exception as { status?: unknown; statusCode?: unknown };
+    const status = value.status ?? value.statusCode;
+    return typeof status === 'number' ? status : undefined;
   }
 }
