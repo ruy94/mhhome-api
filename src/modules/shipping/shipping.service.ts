@@ -247,6 +247,74 @@ export class ShippingService {
     ).data;
   }
 
+  async softCancelMarketplaceShippingOrder(orderId: number) {
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        code: true,
+        status: true,
+        updatedAt: true,
+        marketplaceSubOrderId: true,
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (!order.marketplaceSubOrderId) {
+      throw new BadRequestException(`Đơn #${order.code} không phải đơn mua chéo`);
+    }
+    if (order.status === OrderStatus.SoftCancel) return order;
+    if (order.status !== OrderStatus.Prepare) {
+      throw new BadRequestException('Chỉ hủy đột ngột đơn đang giao cho đơn vị vận chuyển');
+    }
+
+    await this.marketplaceClient.requestSourceShipmentSoftCancel(
+      order.marketplaceSubOrderId,
+      `source-soft-cancel:${order.marketplaceSubOrderId}:${order.updatedAt.getTime()}`,
+    );
+    const updated = await this.prisma.order.updateMany({
+      where: { id: order.id, status: OrderStatus.Prepare },
+      data: { status: OrderStatus.SoftCancel },
+    });
+    if (!updated.count) {
+      throw new BadRequestException('Trạng thái đơn đã thay đổi, vui lòng tải lại');
+    }
+    return this.prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+  }
+
+  async releaseMarketplaceSoftCancel(orderId: number) {
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        code: true,
+        status: true,
+        updatedAt: true,
+        marketplaceSubOrderId: true,
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (!order.marketplaceSubOrderId) {
+      throw new BadRequestException(`Đơn #${order.code} không phải đơn mua chéo`);
+    }
+    if (order.status === OrderStatus.Pending) return order;
+    if (order.status !== OrderStatus.SoftCancel) {
+      throw new BadRequestException('Đơn không ở trạng thái hủy đột ngột');
+    }
+
+    await this.marketplaceClient.releaseSourceShipmentSoftCancel(
+      order.marketplaceSubOrderId,
+      `source-soft-cancel-release:${order.marketplaceSubOrderId}:${order.updatedAt.getTime()}`,
+    );
+    const updated = await this.prisma.order.updateMany({
+      where: { id: order.id, status: OrderStatus.SoftCancel },
+      data: { status: OrderStatus.Pending },
+    });
+    if (!updated.count) {
+      throw new BadRequestException('Trạng thái đơn đã thay đổi, vui lòng tải lại');
+    }
+    return this.prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+  }
+
   async cancelMarketplaceShippingOrder(orderId: number) {
     const [subOrderId] = await this.marketplaceSubOrderIds([orderId]);
     return (

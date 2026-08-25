@@ -135,6 +135,20 @@ export class MarketplaceClientService {
     });
   }
 
+  requestSourceShipmentSoftCancel(subOrderId: string, idempotencyKey: string) {
+    return this.request<unknown>(
+      `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/soft-cancel`,
+      { method: 'POST', body: {}, idempotencyKey },
+    );
+  }
+
+  releaseSourceShipmentSoftCancel(subOrderId: string, idempotencyKey: string) {
+    return this.request<unknown>(
+      `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/soft-cancel/release`,
+      { method: 'POST', body: {}, idempotencyKey },
+    );
+  }
+
   cancelSourceShipment(subOrderId: string, idempotencyKey: string) {
     return this.request<unknown>(
       `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/cancel`,

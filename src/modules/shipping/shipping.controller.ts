@@ -44,6 +44,18 @@ export class ShippingController {
     return this.shippingService.refreshMarketplaceTrackings(dto.orderIds);
   }
 
+  @Post('marketplace/orders/:orderId/soft-cancel')
+  @RequirePermissions('order:update_status')
+  softCancelMarketplaceShippingOrder(@Param('orderId', ParseIntPipe) orderId: number) {
+    return this.shippingService.softCancelMarketplaceShippingOrder(orderId);
+  }
+
+  @Post('marketplace/orders/:orderId/soft-cancel/release')
+  @RequirePermissions('order:update_status')
+  releaseMarketplaceSoftCancel(@Param('orderId', ParseIntPipe) orderId: number) {
+    return this.shippingService.releaseMarketplaceSoftCancel(orderId);
+  }
+
   @Post('marketplace/orders/:orderId/cancel')
   @RequirePermissions('order:update_tracking')
   cancelMarketplaceShippingOrder(@Param('orderId', ParseIntPipe) orderId: number) {
