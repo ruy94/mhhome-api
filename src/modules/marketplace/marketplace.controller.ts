@@ -54,6 +54,26 @@ export class MarketplaceSourceController {
 
   @Get('sender-profile')
   getSenderProfile() {
+    const useVtpSender =
+      this.config.get<boolean>('shipping.vtp.enabled') === true
+      && this.config.get<boolean>('shipping.spx.enabled') !== true;
+    if (useVtpSender) {
+      return {
+        name: this.config.get<string>('shipping.vtp.sender.name') ?? '',
+        phone: this.config.get<string>('shipping.vtp.sender.phone') ?? '',
+        state: '',
+        city: '',
+        district: null,
+        detailAddress: this.config.get<string>('shipping.vtp.sender.address') ?? '',
+        addressVersion: 0,
+        longitude: null,
+        latitude: null,
+        features: {
+          electronicInvoiceEnabled:
+            this.config.get<boolean>('app.features.electronicInvoiceEnabled') === true,
+        },
+      };
+    }
     return {
       name: this.config.get<string>('shipping.spx.sender.name') ?? '',
       phone: this.config.get<string>('shipping.spx.sender.phone') ?? '',
@@ -186,6 +206,11 @@ export class MiniappMarketplaceController {
   @Delete('users/:userId/cart')
   clearCart(@Param('userId', ParseIntPipe) userId: number) {
     return this.cart.clear(userId);
+  }
+
+  @Get('shipping/providers')
+  async shippingProviders() {
+    return (await this.client.getShippingProviders()).data;
   }
 
   @Post('checkout/quote')

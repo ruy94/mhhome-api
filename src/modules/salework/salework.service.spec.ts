@@ -26,9 +26,9 @@ describe('SaleworkService syncLinkedVariantStocks', () => {
     };
     const variant = {
         findMany: jest.fn().mockResolvedValue([
-          { id: 1, productId: 10, saleworkProductCode: 'SKU_POSITIVE', saleworkWarehouseId: 'W1' },
-          { id: 2, productId: 11, saleworkProductCode: 'SKU_NEGATIVE', saleworkWarehouseId: 'W1' },
-          { id: 3, productId: 12, saleworkProductCode: 'SKU_MISSING', saleworkWarehouseId: 'W1' },
+          { id: 1, productId: 10, stock: 0, saleworkProductCode: 'SKU_POSITIVE', saleworkWarehouseId: 'W1' },
+          { id: 2, productId: 11, stock: 0, saleworkProductCode: 'SKU_NEGATIVE', saleworkWarehouseId: 'W1' },
+          { id: 3, productId: 12, stock: 0, saleworkProductCode: 'SKU_MISSING', saleworkWarehouseId: 'W1' },
         ]),
         update: jest.fn().mockResolvedValue({}),
     };
@@ -43,12 +43,20 @@ describe('SaleworkService syncLinkedVariantStocks', () => {
       $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback({ variant })),
     };
     const marketplaceCatalog = { recordProductChanges: jest.fn().mockResolvedValue(undefined) };
+    const configService = { get: jest.fn() };
+    const redis = { getClient: jest.fn() };
+    const schedulerRegistry = { addCronJob: jest.fn() };
+    const adminNotifications = { publishRealtimeToActiveAdmins: jest.fn().mockResolvedValue(undefined) };
 
     return {
       service: new SaleworkService(
         saleworkClient as never,
         prisma as never,
         marketplaceCatalog as never,
+        configService as never,
+        redis as never,
+        adminNotifications as never,
+        schedulerRegistry as never,
       ),
       saleworkClient,
       prisma,

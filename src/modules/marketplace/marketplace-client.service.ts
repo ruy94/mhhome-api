@@ -38,6 +38,10 @@ export class MarketplaceClientService {
     );
   }
 
+  getShippingProviders() {
+    return this.request<unknown[]>('/api/v1/marketplace/checkout/providers');
+  }
+
   quoteCheckout(payload: unknown) {
     return this.request<unknown>('/api/v1/marketplace/checkout/quote', {
       method: 'POST',
@@ -149,6 +153,20 @@ export class MarketplaceClientService {
     );
   }
 
+  updateSourceVtpShipment(subOrderId: string, payload: unknown, idempotencyKey: string) {
+    return this.request<unknown>(
+      `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/updates`,
+      { method: 'POST', body: payload, idempotencyKey },
+    );
+  }
+
+  sourceVtpStatusAction(subOrderId: string, payload: unknown, idempotencyKey: string) {
+    return this.request<unknown>(
+      `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/vtp-status-actions`,
+      { method: 'POST', body: payload, idempotencyKey },
+    );
+  }
+
   cancelSourceShipment(subOrderId: string, idempotencyKey: string) {
     return this.request<unknown>(
       `/api/v1/marketplace/source-fulfillment/shipments/${encodeURIComponent(subOrderId)}/cancel`,
@@ -197,9 +215,30 @@ export class MarketplaceClientService {
       });
       if (!response.ok) {
         const responseText = await response.text();
-        throw new BadGatewayException(
-          `Marketplace returned HTTP ${response.status}${responseText ? `: ${responseText}` : ''}`,
-        );
+        let responseBody: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(responseText) as unknown;
+          if (parsed && typeof parsed === 'object') {
+            responseBody = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // Keep the fallback message when the upstream body is not JSON.
+        }
+        const rawMessage = responseBody['message'];
+        const message = Array.isArray(rawMessage)
+          ? String(rawMessage[0] ?? '')
+          : typeof rawMessage === 'string'
+            ? rawMessage
+            : `Marketplace returned HTTP ${response.status}`;
+        const code =
+          typeof responseBody['code'] === 'string' ? responseBody['code'] : undefined;
+        const details = responseBody['details'];
+        throw new BadGatewayException({
+          message,
+          error: 'Bad Gateway',
+          ...(code ? { code } : {}),
+          ...(details !== undefined ? { details } : {}),
+        });
       }
       return (await response.json()) as MarketplaceResponse<T>;
     } catch (error) {

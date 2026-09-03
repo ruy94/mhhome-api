@@ -11,7 +11,7 @@ const createService = (overrides: Partial<ConstructorParameters<typeof SaleworkC
     stockBaseUrl: 'https://salework.net/api/open/stock',
     bankingBaseUrl: 'https://banking.salework.net/api/open',
     ...overrides,
-  });
+  } as ConstructorParameters<typeof SaleworkClientService>[0]);
 
 describe('SaleworkClientService', () => {
   afterEach(() => {

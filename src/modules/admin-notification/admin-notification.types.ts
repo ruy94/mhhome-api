@@ -17,6 +17,12 @@ export interface CreateAdminNotificationInput {
 
 export interface AdminNotificationEventEnvelope {
   adminIds: string[];
-  event: 'notification.created' | 'notification.read' | 'notification.read-all';
+  event:
+    | 'notification.created'
+    | 'notification.read'
+    | 'notification.read-all'
+    | 'salework.stock.reconciled'
+    | 'shipping.spx.updated'
+    | 'shipping.vtp.updated';
   data: string | object;
 }

@@ -1,4 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { SchedulerRegistry } from '@nestjs/schedule';
+import { CronJob } from 'cron';
+import { randomUUID } from 'node:crypto';
 
 import { SaleworkClientService } from '../integrations/salework/salework-client.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -21,19 +25,61 @@ import type { SaleworkProductReportDto } from './dto/salework-report.dto.js';
 import type { SaleworkWarehouseTransactionDto } from './dto/salework-warehouse.dto.js';
 import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 import { MarketplaceReservationStatus } from '../../generated/prisma/enums.js';
+import { RedisService } from '../../common/redis/redis.service.js';
+import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
+
+const STOCK_RECONCILIATION_JOB = 'salework-stock-reconciliation';
 
 @Injectable()
-export class SaleworkService {
+export class SaleworkService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(SaleworkService.name);
+  private reconciliationJob: CronJob | null = null;
+
   constructor(
     private readonly saleworkClient: SaleworkClientService,
     private readonly prisma: PrismaService,
     private readonly marketplaceCatalog: MarketplaceCatalogService,
+    private readonly configService: ConfigService,
+    private readonly redis: RedisService,
+    private readonly adminNotifications: AdminNotificationService,
+    private readonly schedulerRegistry: SchedulerRegistry,
   ) {}
+
+  onModuleInit(): void {
+    if (
+      this.configService.get<boolean>('salework.enabled') !== true ||
+      this.configService.get<boolean>('salework.stockReconciliationEnabled') !== true
+    ) {
+      return;
+    }
+
+    const cronTime =
+      this.configService.get<string>('salework.stockReconciliationCron') ??
+      '0 */2 * * * *';
+    try {
+      this.reconciliationJob = CronJob.from({
+        cronTime,
+        onTick: () => void this.reconcileLinkedVariantStocks(),
+        start: true,
+      });
+      this.schedulerRegistry.addCronJob(STOCK_RECONCILIATION_JOB, this.reconciliationJob);
+      this.logger.log(`SaleWork stock reconciliation scheduled: ${cronTime}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid SALEWORK_STOCK_RECONCILIATION_CRON: ${message}`);
+    }
+  }
+
+  onModuleDestroy(): void {
+    this.reconciliationJob?.stop();
+    this.reconciliationJob = null;
+  }
 
   getProducts(): Promise<SaleworkProductsData> {
     return this.saleworkClient.getProducts();
   }
 
+  /** Pulls authoritative SaleWork stock for variants linked to SaleWork warehouses. */
   async syncLinkedVariantStocks() {
     const salework = await this.saleworkClient.getProducts();
     const variants = await this.prisma.variant.findMany({
@@ -45,6 +91,7 @@ export class SaleworkService {
       select: {
         id: true,
         productId: true,
+        stock: true,
         saleworkProductCode: true,
         saleworkWarehouseId: true,
       },
@@ -102,14 +149,19 @@ export class SaleworkService {
       });
     }
 
+    const currentStockByVariant = new Map(variants.map((variant) => [variant.id, variant.stock]));
+    const changedItems = items.filter(
+      (item) => currentStockByVariant.get(item.variantId) !== item.appliedStock,
+    );
+
     await this.prisma.$transaction(async (tx) => {
-      for (const item of items) {
+      for (const item of changedItems) {
         await tx.variant.update({
           where: { id: item.variantId },
           data: { stock: item.appliedStock },
         });
       }
-      const updatedIds = new Set(items.map((item) => item.variantId));
+      const updatedIds = new Set(changedItems.map((item) => item.variantId));
       await this.marketplaceCatalog.recordProductChanges(
         tx,
         variants
@@ -118,13 +170,55 @@ export class SaleworkService {
       );
     });
 
+    if (changedItems.length) {
+      await this.adminNotifications.publishRealtimeToActiveAdmins('salework.stock.reconciled', {
+        updatedVariantIds: changedItems.map((item) => item.variantId),
+        updatedCount: changedItems.length,
+        occurredAt: new Date().toISOString(),
+      });
+    }
+
     return {
       totalLinked: variants.length,
-      updated: items.length,
+      updated: changedItems.length,
       skipped: skippedItems.length,
       items,
       skippedItems,
     };
+  }
+
+  async reconcileLinkedVariantStocks(): Promise<void> {
+    const enabled = this.configService.get<boolean>('salework.enabled') === true;
+    const reconciliationEnabled =
+      this.configService.get<boolean>('salework.stockReconciliationEnabled') === true;
+    if (!enabled || !reconciliationEnabled) return;
+
+    const lockKey = 'salework:stock-reconciliation';
+    const lockValue = randomUUID();
+    const ttlSeconds =
+      this.configService.get<number>('salework.stockReconciliationLockTtlSeconds') ?? 110;
+    const locked = await this.redis.getClient().set(lockKey, lockValue, 'EX', ttlSeconds, 'NX');
+    if (locked !== 'OK') return;
+
+    try {
+      const result = await this.syncLinkedVariantStocks();
+      this.logger.log(
+        `SaleWork stock reconciliation updated ${result.updated}/${result.totalLinked} linked variants`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`SaleWork stock reconciliation failed: ${message}`);
+    } finally {
+      await this.redis
+        .getClient()
+        .eval(
+          'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0',
+          1,
+          lockKey,
+          lockValue,
+        )
+        .catch(() => undefined);
+    }
   }
 
   getAddressList(): Promise<SaleworkAddressData> {

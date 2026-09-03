@@ -27,8 +27,8 @@ model Admin {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  roles     AdminRole[]
-  campaigns Campaign[]
+  roles                  AdminRole[]
+  campaigns              Campaign[]
   notificationRecipients AdminNotificationRecipient[]
 
   @@map("admins")
@@ -78,6 +78,7 @@ model AdminNotificationRecipient {
   @@index([adminId, readAt, createdAt])
   @@map("admin_notification_recipients")
 }
+
 model Role {
   id          String  @id @default(cuid())
   name        String  @unique
@@ -451,13 +452,15 @@ model Order {
 
   platform OrderPlatform @default(ZaloMiniApp)
 
-  marketplaceParentId      String? @map("marketplace_parent_id")
-  marketplaceSubOrderId    String? @unique @map("marketplace_sub_order_id")
-  marketplaceReservationId String? @unique @map("marketplace_reservation_id")
-  hostShopCode              String? @map("host_shop_code") @db.VarChar(50)
-  opaqueCustomerRef         String? @map("opaque_customer_ref") @db.VarChar(100)
-  recipientSnapshot         Json?   @map("recipient_snapshot") @db.JsonB
-  senderSnapshot            Json?   @map("sender_snapshot") @db.JsonB
+  marketplaceParentId      String?          @map("marketplace_parent_id")
+  marketplaceSubOrderId    String?          @unique @map("marketplace_sub_order_id")
+  marketplaceReservationId String?          @unique @map("marketplace_reservation_id")
+  hostShopCode             String?          @map("host_shop_code") @db.VarChar(50)
+  opaqueCustomerRef        String?          @map("opaque_customer_ref") @db.VarChar(100)
+  recipientSnapshot        Json?            @map("recipient_snapshot") @db.JsonB
+  senderSnapshot           Json?            @map("sender_snapshot") @db.JsonB
+  shippingProvider         ShippingProvider @default(SPX) @map("shipping_provider")
+  shippingQuoteSnapshot    Json?            @map("shipping_quote_snapshot") @db.JsonB
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -469,8 +472,8 @@ model Order {
   productVoucher  Voucher? @relation("ProductVoucher", fields: [productVoucherId], references: [id])
   shippingVoucher Voucher? @relation("ShippingVoucher", fields: [deliveryVoucherId], references: [id])
 
-  affiliateCommission AffiliateCommission?
-  shippingOrders      ShippingOrder[]
+  affiliateCommission    AffiliateCommission?
+  shippingOrders         ShippingOrder[]
   marketplaceReservation MarketplaceCheckoutReservation?
 
   @@map("orders")
@@ -478,6 +481,7 @@ model Order {
 
 enum ShippingProvider {
   SPX
+  VTP
   JNT
 }
 
@@ -527,6 +531,9 @@ model ShippingOrder {
   trackingLink                 String?             @map("tracking_link") @db.VarChar(255)
   providerStatus               String?             @map("provider_status") @db.VarChar(100)
   providerStatusCode           String?             @map("provider_status_code") @db.VarChar(50)
+  providerServiceCode          String?             @map("provider_service_code") @db.VarChar(50)
+  providerServiceName          String?             @map("provider_service_name") @db.VarChar(150)
+  expectedDelivery             String?             @map("expected_delivery") @db.VarChar(150)
   trackingSyncedAt             DateTime?           @map("tracking_synced_at")
   estimatedFee                 Decimal?            @map("estimated_fee") @db.Decimal(15, 0)
   actualFee                    Decimal?            @map("actual_fee") @db.Decimal(15, 0)
@@ -578,14 +585,16 @@ model ShippingEvent {
 }
 
 model ShippingWebhookEvent {
-  id          Int              @id @default(autoincrement())
-  provider    ShippingProvider
-  eventId     String?          @map("event_id") @db.VarChar(160)
-  eventType   String           @map("event_type") @db.VarChar(80)
-  payloadHash String           @unique @map("payload_hash") @db.VarChar(64)
-  rawPayload  Json?            @map("raw_payload") @db.JsonB
-  processedAt DateTime?        @map("processed_at")
-  createdAt   DateTime         @default(now()) @map("created_at")
+  id           Int              @id @default(autoincrement())
+  provider     ShippingProvider
+  eventId      String?          @map("event_id") @db.VarChar(160)
+  eventType    String           @map("event_type") @db.VarChar(80)
+  payloadHash  String           @unique @map("payload_hash") @db.VarChar(64)
+  rawPayload   Json?            @map("raw_payload") @db.JsonB
+  processedAt  DateTime?        @map("processed_at")
+  attemptCount Int              @default(0) @map("attempt_count")
+  errorMessage String?          @map("error_message") @db.Text
+  createdAt    DateTime         @default(now()) @map("created_at")
 
   @@index([eventType])
   @@index([eventId])

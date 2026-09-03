@@ -204,7 +204,78 @@ export class EnvironmentVariables {
 
   @IsOptional()
   @IsBoolean()
+  VTP_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  VTP_ENV?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_USERNAME?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_PASSWORD?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  VTP_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @IsString()
+  VTP_WEBHOOK_SECRET?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_PRINT_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_PRINT_LABEL_TYPE?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  VTP_PRINT_SHOW_POSTAGE?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(60)
+  VTP_PRINT_EXPIRY_SECONDS?: number;
+
+  @IsOptional()
+  @IsString()
+  VTP_SENDER_NAME?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_SENDER_PHONE?: string;
+
+  @IsOptional()
+  @IsString()
+  VTP_SENDER_ADDRESS?: string;
+
+  @IsOptional()
+  @IsBoolean()
   SALEWORK_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  SALEWORK_STOCK_RECONCILIATION_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  SALEWORK_STOCK_RECONCILIATION_CRON?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(30)
+  SALEWORK_STOCK_RECONCILIATION_LOCK_TTL_SECONDS?: number;
 
   @IsOptional()
   @IsString()
@@ -289,7 +360,10 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
   const booleanKeys = [
     'ELECTRONIC_INVOICE_ENABLED',
     'SPX_ENABLED',
+    'VTP_ENABLED',
+    'VTP_PRINT_SHOW_POSTAGE',
     'SALEWORK_ENABLED',
+    'SALEWORK_STOCK_RECONCILIATION_ENABLED',
     'MARKETPLACE_ENABLED',
     'MARKETPLACE_CHECKOUT_ENABLED',
   ] as const;
@@ -336,12 +410,26 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
       'SPX_SENDER_CITY',
       'SPX_SENDER_DETAIL_ADDRESS',
     ] as const;
-    const missing = requiredMarketplaceKeys.filter(
-      (key) => !String(validated[key] ?? '').trim(),
-    );
+    const missing = requiredMarketplaceKeys.filter((key) => !String(validated[key] ?? '').trim());
     if (missing.length) {
       throw new Error(
         `Env validation failed:\nMissing Marketplace configuration: ${missing.join(', ')}`,
+      );
+    }
+  }
+  if (validated.VTP_ENABLED) {
+    const requiredVtpKeys = [
+      'VTP_USERNAME',
+      'VTP_PASSWORD',
+      'VTP_WEBHOOK_SECRET',
+      'VTP_SENDER_NAME',
+      'VTP_SENDER_PHONE',
+      'VTP_SENDER_ADDRESS',
+    ] as const;
+    const missing = requiredVtpKeys.filter((key) => !String(validated[key] ?? '').trim());
+    if (missing.length) {
+      throw new Error(
+        `Env validation failed:\nMissing ViettelPost configuration: ${missing.join(', ')}`,
       );
     }
   }

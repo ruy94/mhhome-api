@@ -1,11 +1,25 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { CreateOrderDto } from '../order/dto/create-order.dto.js';
 import type { QuotedOrderItem } from '../order/order.service.js';
 import { SpxShippingClientService } from '../integrations/shipping/spx/spx-shipping-client.service.js';
+import { VtpShippingClientService } from '../integrations/shipping/vtp/vtp-shipping-client.service.js';
+import type {
+  VtpEditInput,
+  VtpFailureDetails,
+  VtpWebhookData,
+} from '../integrations/shipping/vtp/vtp-shipping.types.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import {
   OrderStatus,
@@ -36,7 +50,10 @@ import {
   SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES,
 } from './spx-status-mapper.js';
 import { MarketplaceClientService } from '../marketplace/marketplace-client.service.js';
+import { mapVtpStatus } from './vtp-status-mapper.js';
 
+import { RedisService } from '../../common/redis/redis.service.js';
+import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
 const SPX_VN_MAX_PARCEL_WEIGHT_GRAMS = 15_000;
 const SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE =
   'Giỏ hàng vượt quá trọng lượng vận chuyển (tối đa 15kg), hãy chia bớt sản phẩm cho đơn sau';
@@ -48,7 +65,10 @@ export class ShippingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly redis: RedisService,
+    private readonly adminNotifications: AdminNotificationService,
     private readonly spxClient: SpxShippingClientService,
+    private readonly vtpClient: VtpShippingClientService,
     private readonly saleWorkStockSync: SaleWorkStockSyncService,
     private readonly orderInventory: OrderInventoryService,
     private readonly marketplaceClient: MarketplaceClientService,
@@ -56,6 +76,16 @@ export class ShippingService {
 
   isSpxEnabled() {
     return this.configService.get<boolean>('shipping.spx.enabled') === true;
+  }
+
+  isVtpEnabled() {
+    return this.configService.get<boolean>('shipping.vtp.enabled') === true;
+  }
+
+  isProviderEnabled(provider: ShippingProvider) {
+    if (provider === ShippingProvider.SPX) return this.isSpxEnabled();
+    if (provider === ShippingProvider.VTP) return this.isVtpEnabled();
+    return false;
   }
 
   @Cron('0 */10 * * * *')
@@ -75,6 +105,38 @@ export class ShippingService {
     }
   }
 
+  @Cron('*/30 * * * * *')
+  async handleSpxWebhookRetryCron() {
+    if (!this.isSpxEnabled()) return;
+
+    const events = await this.prisma.shippingWebhookEvent.findMany({
+      where: {
+        provider: ShippingProvider.SPX,
+        processedAt: null,
+        attemptCount: { lt: 10 },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
+    });
+    for (const event of events) await this.processSpxWebhookEvent(event.id);
+  }
+
+  @Cron('*/30 * * * * *')
+  async handleVtpWebhookRetryCron() {
+    if (!this.isVtpEnabled()) return;
+
+    const events = await this.prisma.shippingWebhookEvent.findMany({
+      where: {
+        provider: ShippingProvider.VTP,
+        processedAt: null,
+        attemptCount: { lt: 10 },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
+    });
+    for (const event of events) await this.processVtpWebhookEvent(event.id);
+  }
+
   async estimateCheckoutDeliveryFee(
     tx: Prisma.TransactionClient,
     dto: CreateOrderDto,
@@ -85,10 +147,12 @@ export class ShippingService {
     if (provider === ShippingProvider.JNT) {
       throw new BadRequestException('J&T Express chưa được hỗ trợ');
     }
-    if (provider !== ShippingProvider.SPX) {
+    if (provider !== ShippingProvider.SPX && provider !== ShippingProvider.VTP) {
       throw new BadRequestException('Phương thức vận chuyển không hợp lệ');
     }
-    if (!this.isSpxEnabled()) return { deliveryFee: dto.deliveryFee ?? 0, shippingQuote: null };
+    if (!this.isProviderEnabled(provider)) {
+      throw new BadRequestException('Đơn vị vận chuyển đang tạm ngưng');
+    }
 
     const draft = await this.buildDraftFromCheckout(
       tx,
@@ -96,14 +160,489 @@ export class ShippingService {
       dto,
       quoteItems,
       payableAmountBeforeDelivery,
+      provider,
     );
-    const [estimate] = await this.spxClient.estimateFee([draft]);
-    if (!estimate) throw new BadRequestException('SPX không trả về phí vận chuyển dự kiến');
+    const estimate =
+      provider === ShippingProvider.VTP
+        ? await this.vtpClient.estimateFee(draft)
+        : (await this.spxClient.estimateFee([draft]))[0];
+    if (!estimate) {
+      throw new BadRequestException(
+        provider === ShippingProvider.VTP
+          ? 'ViettelPost không trả về phí vận chuyển dự kiến'
+          : 'SPX không trả về phí vận chuyển dự kiến',
+      );
+    }
 
     return {
       deliveryFee: Math.round(estimate.estimatedFee),
       shippingQuote: estimate,
     };
+  }
+
+  async createOrders(orderIds: number[]) {
+    const uniqueOrderIds = [...new Set(orderIds)].filter((id) => Number.isInteger(id) && id > 0);
+    if (!uniqueOrderIds.length) throw new BadRequestException('Vui lòng chọn ít nhất một đơn hàng');
+
+    const orders = await this.prisma.order.findMany({
+      where: { id: { in: uniqueOrderIds } },
+      select: { id: true, code: true, shippingProvider: true },
+    });
+    if (orders.length !== uniqueOrderIds.length) {
+      throw new NotFoundException('Một số đơn hàng không tồn tại');
+    }
+
+    const byProvider = new Map<ShippingProvider, number[]>();
+    for (const order of orders) {
+      const ids = byProvider.get(order.shippingProvider) ?? [];
+      ids.push(order.id);
+      byProvider.set(order.shippingProvider, ids);
+    }
+
+    const providers: Array<{ provider: ShippingProvider; result: Record<string, unknown> }> = [];
+    for (const [provider, ids] of byProvider) {
+      try {
+        const rawResult =
+          provider === ShippingProvider.SPX
+            ? await this.createSpxOrders(ids)
+            : provider === ShippingProvider.VTP
+              ? await this.createVtpOrders(ids)
+              : (() => {
+                  throw new BadRequestException('Đơn vị vận chuyển chưa được hỗ trợ');
+                })();
+        providers.push({
+          provider,
+          result: this.normalizeShippingCreateResult(rawResult, provider, ids, orders),
+        });
+      } catch (error) {
+        const failures = this.shippingFailuresFromError(error, provider, ids, orders);
+        providers.push({
+          provider,
+          result: {
+            totalCount: ids.length,
+            successCount: 0,
+            failCount: ids.length,
+            trackingNos: [],
+            failures,
+            awbFailures: [],
+          },
+        });
+      }
+    }
+
+    const totalCount = providers.reduce(
+      (total, item) => total + (this.asNumber(item.result['totalCount']) ?? 0),
+      0,
+    );
+    const successCount = providers.reduce(
+      (total, item) => total + (this.asNumber(item.result['successCount']) ?? 0),
+      0,
+    );
+    const failCount = providers.reduce(
+      (total, item) => total + (this.asNumber(item.result['failCount']) ?? 0),
+      0,
+    );
+    const failures = providers.flatMap((item) =>
+      Array.isArray(item.result['failures']) ? item.result['failures'] : [],
+    );
+    const trackingNos = providers.flatMap((item) =>
+      Array.isArray(item.result['trackingNos'])
+        ? item.result['trackingNos'].filter((value): value is string => typeof value === 'string')
+        : [],
+    );
+    const awbFailures = providers.flatMap((item) =>
+      Array.isArray(item.result['awbFailures']) ? item.result['awbFailures'] : [],
+    );
+
+    if (successCount === 0 && failCount > 0) {
+      const onlyVtp = providers.length === 1 && providers[0].provider === ShippingProvider.VTP;
+      throw new BadGatewayException({
+        message: onlyVtp
+          ? 'Không thể tạo vận đơn ViettelPost'
+          : 'Không thể tạo vận đơn với các đơn vị vận chuyển đã chọn',
+        error: 'Bad Gateway',
+        code: onlyVtp ? 'VTP_SHIPPING_FAILED' : 'SHIPPING_FAILED',
+        details: { totalCount, successCount, failCount, trackingNos, failures },
+      });
+    }
+
+    if (providers.length === 1) return providers[0].result;
+    return {
+      totalCount,
+      successCount,
+      failCount,
+      trackingNos,
+      failures,
+      awbFailures,
+      providers,
+    };
+  }
+
+  async createVtpOrders(orderIds: number[]) {
+    this.assertVtpEnabled();
+    const uniqueOrderIds = [...new Set(orderIds)].filter((id) => Number.isInteger(id) && id > 0);
+    if (!uniqueOrderIds.length) {
+      throw new BadRequestException('Vui lòng chọn ít nhất một đơn hàng');
+    }
+    if (uniqueOrderIds.length > 100) {
+      throw new BadRequestException('ViettelPost chỉ hỗ trợ tối đa 100 đơn mỗi lần');
+    }
+
+    const lockToken = randomUUID();
+    const lockKeys: string[] = [];
+    try {
+      for (const orderId of [...uniqueOrderIds].sort((left, right) => left - right)) {
+        const key = `shipping:vtp:create:${orderId}`;
+        const locked = await this.redis.getClient().set(key, lockToken, 'EX', 300, 'NX');
+        if (locked !== 'OK') {
+          throw new ConflictException(
+            `Đơn #${orderId} đang được xử lý vận chuyển, vui lòng thử lại sau`,
+          );
+        }
+        lockKeys.push(key);
+      }
+      return await this.createVtpOrdersLocked(uniqueOrderIds);
+    } finally {
+      await Promise.all(
+        lockKeys.map((key) =>
+          this.redis
+            .getClient()
+            .eval(
+              'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end',
+              1,
+              key,
+              lockToken,
+            )
+            .catch(() => undefined),
+        ),
+      );
+    }
+  }
+
+  private async createVtpOrdersLocked(uniqueOrderIds: number[]) {
+    const orders = await this.prisma.order.findMany({
+      where: { id: { in: uniqueOrderIds } },
+      include: {
+        shippingOrders: {
+          where: {
+            managedBy: ShippingManagedBy.Local,
+            provider: ShippingProvider.VTP,
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        },
+        orderProducts: {
+          include: {
+            product: { select: { id: true, name: true, image: true } },
+            variant: true,
+          },
+        },
+      },
+    });
+    if (orders.length !== uniqueOrderIds.length) {
+      throw new NotFoundException('Một số đơn hàng không tồn tại');
+    }
+
+    for (const order of orders) {
+      if (order.shippingProvider !== ShippingProvider.VTP) {
+        throw new BadRequestException(`Đơn #${order.code} không chọn ViettelPost`);
+      }
+      if (order.marketplaceSubOrderId) {
+        throw new BadRequestException(`Đơn #${order.code} do Marketplace quản lý vận chuyển`);
+      }
+      if (order.status !== OrderStatus.Pending) {
+        throw new BadRequestException(`Đơn #${order.code} không ở trạng thái chờ xử lý`);
+      }
+
+      const latest = order.shippingOrders[0];
+      if (order.trackingCode && !latest?.trackingNo) {
+        throw new BadRequestException(
+          `Đơn #${order.code} đã có mã vận đơn nhưng thiếu audit ViettelPost`,
+        );
+      }
+      if (order.trackingCode && latest?.trackingNo && order.trackingCode !== latest.trackingNo) {
+        throw new BadRequestException(`Đơn #${order.code} có mã vận đơn không đồng nhất`);
+      }
+      if (latest?.status === ShippingOrderStatus.Cancelled) {
+        throw new BadRequestException(`Vận đơn #${order.code} đã bị hủy`);
+      }
+    }
+
+    const addresses = await this.prisma.address.findMany({
+      where: {
+        id: { in: [...new Set(orders.map((order) => order.addressId))] },
+        isDeleted: 0,
+      },
+    });
+    const addressMap = new Map(addresses.map((address) => [address.id, address]));
+    const drafts = orders.map((order) => {
+      const address = addressMap.get(order.addressId);
+      if (!address) {
+        throw new BadRequestException(`Đơn #${order.code} thiếu địa chỉ giao hàng`);
+      }
+      return this.buildDraftFromOrder(order, address, ShippingProvider.VTP);
+    });
+
+    const batch = await this.prisma.shippingBatch.create({
+      data: {
+        provider: ShippingProvider.VTP,
+        status: 'Creating',
+        totalCount: orders.length,
+        requestPayload: this.toJson(drafts),
+      },
+    });
+
+    type StoredShippingOrder = (typeof orders)[number]['shippingOrders'][number];
+    const shippingOrderByOrderId = new Map<number, StoredShippingOrder>();
+    for (const [index, order] of orders.entries()) {
+      const latest = order.shippingOrders[0];
+      if (latest && (latest.trackingNo || latest.status === ShippingOrderStatus.Pending)) {
+        shippingOrderByOrderId.set(order.id, latest);
+        continue;
+      }
+      const created = await this.prisma.shippingOrder.create({
+        data: {
+          orderId: order.id,
+          batchId: batch.id,
+          provider: ShippingProvider.VTP,
+          managedBy: ShippingManagedBy.Local,
+          status: ShippingOrderStatus.Pending,
+          providerOrderId: order.code,
+          estimatedFee: order.deliveryFee,
+          requestPayload: this.toJson(drafts[index]),
+        },
+      });
+      shippingOrderByOrderId.set(order.id, created);
+    }
+
+    const failures: Array<{
+      orderId: number;
+      orderCode: string;
+      provider: 'VTP';
+      stage: VtpFailureDetails['stage'];
+      message: string;
+      trackingNo?: string;
+      providerStatus?: number;
+    }> = [];
+    const successfulShippingOrderIds = new Set<number>();
+
+    for (let offset = 0; offset < orders.length; offset += 5) {
+      await Promise.all(
+        orders.slice(offset, offset + 5).map(async (order, indexInSlice) => {
+          const draft = drafts[offset + indexInSlice];
+          const shippingOrder = shippingOrderByOrderId.get(order.id);
+          if (!shippingOrder) return;
+
+          let trackingNo = shippingOrder.trackingNo;
+          if (trackingNo && shippingOrder.status === ShippingOrderStatus.Created) {
+            successfulShippingOrderIds.add(shippingOrder.id);
+            return;
+          }
+
+          if (!trackingNo) {
+            try {
+              const createResult = await this.vtpClient.createOrder(draft);
+              trackingNo = createResult.trackingNo;
+              await this.prisma.$transaction([
+                this.prisma.shippingOrder.update({
+                  where: { id: shippingOrder.id },
+                  data: {
+                    status: ShippingOrderStatus.Created,
+                    trackingNo,
+                    providerServiceCode: createResult.serviceCode,
+                    providerServiceName: createResult.serviceName,
+                    expectedDelivery: createResult.expectedDelivery,
+                    estimatedFee: createResult.estimatedFee,
+                    actualFee: createResult.actualFee,
+                    responsePayload: this.toJson({ create: createResult.raw }),
+                    errorMessage: null,
+                  },
+                }),
+                this.prisma.order.update({
+                  where: { id: order.id },
+                  data: { trackingCode: trackingNo },
+                }),
+                this.prisma.shippingEvent.create({
+                  data: {
+                    shippingOrderId: shippingOrder.id,
+                    provider: ShippingProvider.VTP,
+                    providerEventId: `create:${trackingNo}`,
+                    trackingNo,
+                    providerOrderId: order.code,
+                    eventType: 'create_order',
+                    status: 'accepted',
+                    statusCode: '102',
+                    message: 'ViettelPost đã tạo và tiếp nhận vận đơn',
+                    rawPayload: this.toJson(createResult.raw),
+                  },
+                }),
+              ]);
+              successfulShippingOrderIds.add(shippingOrder.id);
+            } catch (error) {
+              const details = this.vtpClient.describeError(error, 'create');
+              failures.push({
+                orderId: order.id,
+                orderCode: order.code,
+                provider: 'VTP',
+                stage: details.stage,
+                message: details.message,
+                providerStatus: details.providerStatus,
+              });
+              await this.prisma.$transaction([
+                this.prisma.shippingOrder.update({
+                  where: { id: shippingOrder.id },
+                  data: {
+                    status: ShippingOrderStatus.Failed,
+                    responsePayload: this.toJson(details),
+                    errorMessage: details.message,
+                  },
+                }),
+                this.prisma.shippingEvent.create({
+                  data: {
+                    shippingOrderId: shippingOrder.id,
+                    provider: ShippingProvider.VTP,
+                    providerEventId: `create-failed:${shippingOrder.id}:${Date.now()}`,
+                    providerOrderId: order.code,
+                    eventType: 'create_order',
+                    status: 'failed',
+                    message: details.message,
+                    rawPayload: this.toJson(details),
+                  },
+                }),
+              ]);
+              return;
+            }
+            return;
+          }
+
+          try {
+            await this.prisma.$transaction([
+              this.prisma.shippingOrder.update({
+                where: { id: shippingOrder.id },
+                data: {
+                  status: ShippingOrderStatus.Created,
+                  errorMessage: null,
+                },
+              }),
+              this.prisma.shippingEvent.create({
+                data: {
+                  shippingOrderId: shippingOrder.id,
+                  provider: ShippingProvider.VTP,
+                  providerEventId: `create-recovered:${trackingNo}`,
+                  trackingNo,
+                  providerOrderId: order.code,
+                  eventType: 'create_order',
+                  status: 'accepted',
+                  statusCode: '102',
+                  message: 'ViettelPost đã tạo và tiếp nhận vận đơn',
+                  rawPayload: this.toJson(shippingOrder.responsePayload),
+                },
+              }),
+            ]);
+            successfulShippingOrderIds.add(shippingOrder.id);
+          } catch (error) {
+            const details = this.vtpClient.describeError(error, 'create');
+            failures.push({
+              orderId: order.id,
+              orderCode: order.code,
+              provider: 'VTP',
+              stage: details.stage,
+              message: details.message,
+              trackingNo,
+              providerStatus: details.providerStatus,
+            });
+            await this.prisma.$transaction([
+              this.prisma.shippingOrder.update({
+                where: { id: shippingOrder.id },
+                data: {
+                  status: ShippingOrderStatus.Failed,
+                  errorMessage: details.message,
+                },
+              }),
+              this.prisma.shippingEvent.create({
+                data: {
+                  shippingOrderId: shippingOrder.id,
+                  provider: ShippingProvider.VTP,
+                  providerEventId: `create-recovery-failed:${trackingNo}:${Date.now()}`,
+                  trackingNo,
+                  providerOrderId: order.code,
+                  eventType: 'create_order',
+                  status: 'failed',
+                  message: details.message,
+                  rawPayload: this.toJson(details),
+                },
+              }),
+            ]);
+          }
+        }),
+      );
+    }
+
+    const successCount = successfulShippingOrderIds.size;
+    const failCount = failures.length;
+    await this.prisma.shippingBatch.update({
+      where: { id: batch.id },
+      data: {
+        status: failCount ? (successCount ? 'Partial' : 'Failed') : 'Completed',
+        successCount,
+        failCount,
+        responsePayload: this.toJson({ failures }),
+      },
+    });
+
+    const shippingOrderIds = [...shippingOrderByOrderId.values()].map((item) => item.id);
+    const shippingOrders = await this.prisma.shippingOrder.findMany({
+      where: { id: { in: shippingOrderIds } },
+      include: { batch: true },
+      orderBy: { id: 'asc' },
+    });
+    const trackingNos = shippingOrders
+      .filter((item) => successfulShippingOrderIds.has(item.id))
+      .map((item) => item.trackingNo)
+      .filter((item): item is string => Boolean(item));
+    let awb: Awaited<ReturnType<VtpShippingClientService['getAwbByTrackingNos']>> | null = null;
+    let awbFailures: Array<{ trackingNo: string; message: string }> = [];
+    if (trackingNos.length) {
+      try {
+        awb = await this.vtpClient.getAwbByTrackingNos(trackingNos);
+      } catch (error) {
+        const details = this.vtpClient.describeError(error, 'print');
+        this.logger.warn(`VTP label unavailable after shipment creation: ${details.message}`);
+        awbFailures = trackingNos.map((trackingNo) => ({
+          trackingNo,
+          message: details.message,
+        }));
+      }
+    }
+
+    const result = {
+      batch: await this.prisma.shippingBatch.findUnique({ where: { id: batch.id } }),
+      totalCount: orders.length,
+      successCount,
+      failCount,
+      trackingNos,
+      failures,
+      shippingOrders,
+      awbLink: awb?.awbLink,
+      awbFailures: awb?.failures ?? awbFailures,
+    };
+
+    if (successCount === 0) {
+      throw new BadGatewayException({
+        message: 'Không thể tạo vận đơn ViettelPost',
+        error: 'Bad Gateway',
+        code: 'VTP_SHIPPING_FAILED',
+        details: {
+          batchId: batch.id,
+          totalCount: result.totalCount,
+          successCount: result.successCount,
+          failCount: result.failCount,
+          trackingNos: result.trackingNos,
+          failures: result.failures,
+        },
+      });
+    }
+    return result;
   }
 
   async createSpxOrder(orderId: number) {
@@ -143,6 +682,9 @@ export class ShippingService {
     }
 
     for (const order of orders) {
+      if (order.shippingProvider !== ShippingProvider.SPX) {
+        throw new BadRequestException(`Đơn #${order.code} không chọn SPX`);
+      }
       if (order.marketplaceSubOrderId) {
         throw new BadRequestException(`Đơn #${order.code} do Marketplace quản lý vận chuyển`);
       }
@@ -218,13 +760,28 @@ export class ShippingService {
   }
 
   async createMarketplaceSpxOrders(orderIds: number[]) {
-    const subOrderIds = await this.marketplaceSubOrderIds(orderIds);
-    return (
-      await this.marketplaceClient.createSourceShipments(
-        subOrderIds,
-        `source-shipment:${subOrderIds.join(',')}`,
-      )
-    ).data;
+    const mappings = await this.marketplaceOrderMappings(orderIds);
+    const subOrderIds = mappings.map((item) => item.subOrderId);
+    try {
+      const result = (
+        await this.marketplaceClient.createSourceShipments(
+          subOrderIds,
+          `source-shipment:${subOrderIds.join(',')}`,
+        )
+      ).data;
+      return this.enrichMarketplaceShippingResult(result, mappings);
+    } catch (error) {
+      if (!(error instanceof HttpException)) throw error;
+      const response = this.toRecord(error.getResponse());
+      const details = this.enrichMarketplaceShippingResult(response['details'], mappings);
+      throw new BadGatewayException({
+        message:
+          this.asString(response['message']) ?? 'Marketplace không thể tạo vận đơn mua chéo',
+        error: 'Bad Gateway',
+        ...(this.asString(response['code']) ? { code: this.asString(response['code']) } : {}),
+        ...(Object.keys(details).length ? { details } : {}),
+      });
+    }
   }
 
   async getMarketplaceAwb(orderIds: number[]) {
@@ -318,56 +875,69 @@ export class ShippingService {
   async cancelMarketplaceShippingOrder(orderId: number) {
     const [subOrderId] = await this.marketplaceSubOrderIds([orderId]);
     return (
-      await this.marketplaceClient.cancelSourceShipment(
-        subOrderId,
-        `source-cancel:${subOrderId}`,
-      )
+      await this.marketplaceClient.cancelSourceShipment(subOrderId, `source-cancel:${subOrderId}`)
     ).data;
   }
 
   async getAwbForOrders(input: { orderIds?: number[]; trackingNos?: string[] }) {
-    this.assertSpxEnabled();
-
-    const trackingNos = new Set(
-      (input.trackingNos ?? []).map((trackingNo) => trackingNo.trim()).filter(Boolean),
-    );
-
-    if (input.orderIds?.length) {
-      const shippingOrders = await this.prisma.shippingOrder.findMany({
-        where: {
-          orderId: { in: input.orderIds },
-          provider: ShippingProvider.SPX,
-          managedBy: ShippingManagedBy.Local,
-          trackingNo: { not: null },
-          status: { not: ShippingOrderStatus.Cancelled },
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-      shippingOrders.forEach((shippingOrder) => {
-        if (shippingOrder.trackingNo) trackingNos.add(shippingOrder.trackingNo);
-      });
+    const orderIds = [...new Set(input.orderIds ?? [])];
+    const requestedTrackingNos = [
+      ...new Set((input.trackingNos ?? []).map((value) => value.trim()).filter(Boolean)),
+    ];
+    if (!orderIds.length && !requestedTrackingNos.length) {
+      throw new BadRequestException('Không có mã vận đơn để in nhãn');
     }
 
-    const normalizedTrackingNos = [...trackingNos];
-    if (!normalizedTrackingNos.length)
-      throw new BadRequestException('Không có mã vận đơn để in nhãn');
-    if (normalizedTrackingNos.length > 100)
-      throw new BadRequestException('SPX chỉ hỗ trợ tối đa 100 vận đơn mỗi lần');
+    const shippingOrders = await this.prisma.shippingOrder.findMany({
+      where: {
+        managedBy: ShippingManagedBy.Local,
+        trackingNo: { not: null },
+        status: { not: ShippingOrderStatus.Cancelled },
+        OR: [
+          ...(orderIds.length ? [{ orderId: { in: orderIds } }] : []),
+          ...(requestedTrackingNos.length ? [{ trackingNo: { in: requestedTrackingNos } }] : []),
+        ],
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    const uniqueByTracking = new Map(
+      shippingOrders
+        .filter((item): item is typeof item & { trackingNo: string } => Boolean(item.trackingNo))
+        .map((item) => [item.trackingNo, item]),
+    );
+    if (!uniqueByTracking.size) throw new BadRequestException('Không có mã vận đơn để in nhãn');
+    if (uniqueByTracking.size > 100) {
+      throw new BadRequestException('Chỉ hỗ trợ tối đa 100 vận đơn mỗi lần');
+    }
 
-    const awb = await this.spxClient.getAwbByTrackingNos(normalizedTrackingNos);
-    if (!awb.awbLink) throw new BadRequestException('SPX chưa trả về link nhãn vận đơn');
-    return awb;
+    const byProvider = new Map<ShippingProvider, string[]>();
+    for (const item of uniqueByTracking.values()) {
+      const values = byProvider.get(item.provider) ?? [];
+      values.push(item.trackingNo);
+      byProvider.set(item.provider, values);
+    }
+
+    const results = [];
+    for (const [provider, trackingNos] of byProvider) {
+      if (provider === ShippingProvider.SPX) {
+        this.assertSpxEnabled();
+        results.push({ provider, result: await this.spxClient.getAwbByTrackingNos(trackingNos) });
+      } else if (provider === ShippingProvider.VTP) {
+        this.assertVtpEnabled();
+        results.push({ provider, result: await this.vtpClient.getAwbByTrackingNos(trackingNos) });
+      } else {
+        throw new BadRequestException('Đơn vị vận chuyển chưa hỗ trợ in nhãn');
+      }
+    }
+    return results.length === 1 ? results[0].result : { providers: results };
   }
 
   async cancelShippingOrder(orderId: number) {
-    this.assertSpxEnabled();
-
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
       include: {
         shippingOrders: {
           where: {
-            provider: ShippingProvider.SPX,
             managedBy: ShippingManagedBy.Local,
             trackingNo: { not: null },
           },
@@ -404,29 +974,39 @@ export class ShippingService {
       return updated;
     }
 
-    const result = await this.spxClient.cancelOrders([shippingOrder.trackingNo]);
-    const failure = result.failures.find((item) => item.trackingNo === shippingOrder.trackingNo);
-    if (failure) throw new BadRequestException(failure.message || 'SPX hủy vận đơn thất bại');
+    let raw: unknown;
+    if (shippingOrder.provider === ShippingProvider.SPX) {
+      this.assertSpxEnabled();
+      const result = await this.spxClient.cancelOrders([shippingOrder.trackingNo]);
+      const failure = result.failures.find((item) => item.trackingNo === shippingOrder.trackingNo);
+      if (failure) throw new BadRequestException(failure.message || 'SPX hủy vận đơn thất bại');
+      raw = result.raw;
+    } else if (shippingOrder.provider === ShippingProvider.VTP) {
+      this.assertVtpEnabled();
+      raw = await this.vtpClient.updateStatus(shippingOrder.trackingNo, 4, 'Khách hàng hủy đơn');
+    } else {
+      throw new BadRequestException('Đơn vị vận chuyển chưa hỗ trợ hủy');
+    }
 
     const updatedOrder = await this.prisma.$transaction(async (tx) => {
       await tx.shippingOrder.update({
         where: { id: shippingOrder.id },
         data: {
           status: ShippingOrderStatus.Cancelled,
-          responsePayload: this.toJson(result.raw),
+          responsePayload: this.toJson(raw),
           errorMessage: null,
         },
       });
       await tx.shippingEvent.create({
         data: {
           shippingOrderId: shippingOrder.id,
-          provider: ShippingProvider.SPX,
+          provider: shippingOrder.provider,
           providerEventId: `cancel:${shippingOrder.trackingNo}:${Date.now()}`,
           trackingNo: shippingOrder.trackingNo,
           providerOrderId: shippingOrder.providerOrderId,
           eventType: 'cancel_order',
           status: 'success',
-          rawPayload: this.toJson(result.raw),
+          rawPayload: this.toJson(raw),
         },
       });
       const updated = await tx.order.update({
@@ -447,6 +1027,124 @@ export class ShippingService {
       OrderStatus.Cancel,
     );
     return updatedOrder;
+  }
+
+  async updateVtpShippingOrder(orderId: number, input: VtpEditInput) {
+    this.assertVtpEnabled();
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        shippingOrders: {
+          where: {
+            provider: ShippingProvider.VTP,
+            managedBy: ShippingManagedBy.Local,
+            trackingNo: { not: null },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        },
+        orderProducts: {
+          include: {
+            product: { select: { id: true, name: true, image: true } },
+            variant: true,
+          },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.marketplaceSubOrderId) {
+      return (
+        await this.marketplaceClient.updateSourceVtpShipment(
+          order.marketplaceSubOrderId,
+          input,
+          `source-vtp-update:${order.marketplaceSubOrderId}:${Date.now()}`,
+        )
+      ).data;
+    }
+    const shippingOrder = order.shippingOrders[0];
+    if (!shippingOrder?.trackingNo) {
+      throw new NotFoundException('Đơn hàng chưa có mã vận đơn ViettelPost');
+    }
+    const providerStatusCode = this.asNumber(shippingOrder.providerStatusCode);
+    if (
+      shippingOrder.status === ShippingOrderStatus.Cancelled ||
+      (providerStatusCode !== undefined && providerStatusCode >= 200)
+    ) {
+      throw new BadRequestException('Chỉ sửa vận đơn ViettelPost trước khi lấy hàng');
+    }
+
+    const address = await this.prisma.address.findFirst({
+      where: { id: order.addressId, isDeleted: 0 },
+    });
+    if (!address) throw new BadRequestException('Đơn hàng thiếu địa chỉ giao hàng');
+    const draft = this.buildDraftFromOrder(order, address, ShippingProvider.VTP);
+    const serviceCode =
+      shippingOrder.providerServiceCode ?? (await this.vtpClient.estimateFee(draft)).serviceCode;
+    const result = await this.vtpClient.editOrder(
+      shippingOrder.trackingNo,
+      draft,
+      input,
+      serviceCode,
+    );
+
+    return this.prisma.shippingOrder.update({
+      where: { id: shippingOrder.id },
+      data: {
+        responsePayload: this.toJson(result),
+        actualFee:
+          result.MONEY_TOTAL === undefined ? undefined : Math.round(Number(result.MONEY_TOTAL)),
+        errorMessage: null,
+      },
+    });
+  }
+
+  async updateVtpStatusAction(orderId: number, type: 2 | 3, note?: string) {
+    this.assertVtpEnabled();
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: { marketplaceSubOrderId: true },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.marketplaceSubOrderId) {
+      return (
+        await this.marketplaceClient.sourceVtpStatusAction(
+          order.marketplaceSubOrderId,
+          { type, note },
+          `source-vtp-status:${order.marketplaceSubOrderId}:${type}:${Date.now()}`,
+        )
+      ).data;
+    }
+    const shippingOrder = await this.prisma.shippingOrder.findFirst({
+      where: {
+        orderId,
+        provider: ShippingProvider.VTP,
+        managedBy: ShippingManagedBy.Local,
+        trackingNo: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!shippingOrder?.trackingNo) {
+      throw new NotFoundException('Đơn hàng chưa có mã vận đơn ViettelPost');
+    }
+    if (shippingOrder.providerStatusCode !== '505') {
+      throw new BadRequestException(
+        'Chỉ duyệt hoàn hoặc phát tiếp khi ViettelPost đang ở trạng thái 505',
+      );
+    }
+    const result = await this.vtpClient.updateStatus(shippingOrder.trackingNo, type, note);
+    await this.prisma.shippingEvent.create({
+      data: {
+        shippingOrderId: shippingOrder.id,
+        provider: ShippingProvider.VTP,
+        providerEventId: `status-action:${type}:${shippingOrder.trackingNo}:${Date.now()}`,
+        trackingNo: shippingOrder.trackingNo,
+        providerOrderId: shippingOrder.providerOrderId,
+        eventType: type === 2 ? 'confirm_return' : 'confirm_reattempt',
+        status: 'success',
+        rawPayload: this.toJson(result),
+      },
+    });
+    return result;
   }
 
   async refreshBatch(batchId: number) {
@@ -572,6 +1270,12 @@ export class ShippingService {
       select: { status: true },
     });
     const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
+    const trackingChanged = this.hasSpxTrackingStateChanged(
+      shippingOrder,
+      previousOrder?.status,
+      track,
+      mappedStatus,
+    );
     const result = await this.prisma.$transaction(async (tx) => {
       const updated = await this.applyTrackOrderResult(tx, shippingOrder.id, track);
       if (previousOrder && mappedStatus) {
@@ -590,6 +1294,14 @@ export class ShippingService {
         previousOrder.status,
         mappedStatus,
       );
+    }
+    if (trackingChanged) {
+      await this.adminNotifications.publishRealtimeToActiveAdmins('shipping.spx.updated', {
+        provider: 'SPX',
+        source: 'manual',
+        orderIds: [orderId],
+        occurredAt: new Date().toISOString(),
+      });
     }
     return result;
   }
@@ -643,6 +1355,7 @@ export class ShippingService {
 
     let refreshed = 0;
     let failed = 0;
+    const changedOrderIds = new Set<number>();
     const trackingNos = [...trackingToShippingOrder.keys()];
     for (let index = 0; index < trackingNos.length; index += 50) {
       const chunk = trackingNos.slice(index, index + 50);
@@ -668,6 +1381,12 @@ export class ShippingService {
 
         matchedShippingOrderIds.add(shippingOrder.id);
         const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
+        const trackingChanged = this.hasSpxTrackingStateChanged(
+          shippingOrder,
+          shippingOrder.order.status,
+          track,
+          mappedStatus,
+        );
 
         try {
           await this.prisma.$transaction(async (tx) => {
@@ -689,6 +1408,7 @@ export class ShippingService {
             );
           }
           refreshed += 1;
+          if (trackingChanged) changedOrderIds.add(shippingOrder.orderId);
         } catch (error) {
           failed += 1;
           const message =
@@ -703,6 +1423,15 @@ export class ShippingService {
         const shippingOrder = trackingToShippingOrder.get(trackingNo);
         return shippingOrder ? !matchedShippingOrderIds.has(shippingOrder.id) : true;
       }).length;
+    }
+
+    if (changedOrderIds.size) {
+      await this.adminNotifications.publishRealtimeToActiveAdmins('shipping.spx.updated', {
+        provider: 'SPX',
+        source: 'poll',
+        orderIds: [...changedOrderIds],
+        occurredAt: new Date().toISOString(),
+      });
     }
 
     return { total: shippingOrders.length, refreshed, failed, skipped };
@@ -760,18 +1489,290 @@ export class ShippingService {
       },
     });
 
-    try {
-      await this.applySpxWebhookPayload(eventType, rawPayload);
-      await this.prisma.shippingWebhookEvent.update({
-        where: { id: webhookEvent.id },
-        data: { processedAt: new Date() },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to process SPX webhook';
-      this.logger.error(`SPX webhook ${eventType} failed`, message);
-    }
+    void this.processSpxWebhookEvent(webhookEvent.id);
 
     return { received: true, duplicate: false };
+  }
+
+  private async processSpxWebhookEvent(id: number) {
+    const event = await this.prisma.shippingWebhookEvent.findUnique({ where: { id } });
+    if (!event || event.provider !== ShippingProvider.SPX || event.processedAt) {
+      return { processed: Boolean(event?.processedAt), skipped: true };
+    }
+
+    const lockKey = `shipping:spx:webhook:${id}`;
+    const lockValue = randomUUID();
+    const locked = await this.redis.getClient().set(lockKey, lockValue, 'EX', 60, 'NX');
+    if (locked !== 'OK') return { processed: false, skipped: true };
+
+    try {
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { attemptCount: { increment: 1 }, errorMessage: null },
+      });
+      await this.applySpxWebhookPayload(event.eventType, this.toRecord(event.rawPayload));
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { processedAt: new Date(), errorMessage: null },
+      });
+      await this.adminNotifications.publishRealtimeToActiveAdmins('shipping.spx.updated', {
+        webhookEventId: id,
+        occurredAt: new Date().toISOString(),
+      });
+      return { processed: true, skipped: false };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to process SPX webhook';
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { errorMessage: message },
+      });
+      this.logger.error(`SPX webhook #${id} failed: ${message}`);
+      return { processed: false, skipped: false, error: message };
+    } finally {
+      await this.redis
+        .getClient()
+        .eval(
+          'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0',
+          1,
+          lockKey,
+          lockValue,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  async handleVtpWebhook(payload: unknown) {
+    const rawPayload = this.toRecord(payload);
+    const data = this.toRecord(rawPayload.DATA ?? rawPayload.data ?? rawPayload);
+    const payloadHash = createHash('sha256').update(JSON.stringify(rawPayload)).digest('hex');
+    const existing = await this.prisma.shippingWebhookEvent.findUnique({
+      where: { payloadHash },
+    });
+    if (existing) return { status: 200, received: true, duplicate: true };
+
+    const trackingNo = this.asString(data.ORDER_NUMBER);
+    const statusCode = this.asNumber(data.ORDER_STATUS);
+    const webhookEvent = await this.prisma.shippingWebhookEvent.create({
+      data: {
+        provider: ShippingProvider.VTP,
+        eventId:
+          trackingNo && statusCode !== undefined
+            ? `${trackingNo}:${statusCode}:${this.asString(data.ORDER_STATUSDATE) ?? payloadHash.slice(0, 12)}`
+            : payloadHash,
+        eventType: 'order_status',
+        payloadHash,
+        rawPayload: this.toJson(rawPayload),
+      },
+    });
+
+    void this.processVtpWebhookEvent(webhookEvent.id);
+    return { status: 200, received: true, duplicate: false };
+  }
+
+  async retryVtpWebhookEvent(id: number) {
+    const event = await this.prisma.shippingWebhookEvent.findFirst({
+      where: { id, provider: ShippingProvider.VTP },
+    });
+    if (!event) throw new NotFoundException('ViettelPost webhook event not found');
+    if (event.processedAt) return { processed: true, duplicate: true };
+    return this.processVtpWebhookEvent(id);
+  }
+
+  private async processVtpWebhookEvent(id: number) {
+    const event = await this.prisma.shippingWebhookEvent.findUnique({ where: { id } });
+    if (!event || event.provider !== ShippingProvider.VTP || event.processedAt) {
+      return { processed: Boolean(event?.processedAt), skipped: true };
+    }
+
+    const lockKey = `shipping:vtp:webhook:${id}`;
+    const lockValue = randomUUID();
+    const locked = await this.redis.getClient().set(lockKey, lockValue, 'EX', 60, 'NX');
+    if (locked !== 'OK') return { processed: false, skipped: true };
+
+    try {
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { attemptCount: { increment: 1 }, errorMessage: null },
+      });
+      const rawPayload = this.toRecord(event.rawPayload);
+      const data = this.toRecord(
+        rawPayload.DATA ?? rawPayload.data ?? rawPayload,
+      ) as VtpWebhookData;
+      const orderId = await this.applyVtpWebhookData(data, event.payloadHash);
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { processedAt: new Date(), errorMessage: null },
+      });
+      if (orderId) {
+        await this.adminNotifications.publishRealtimeToActiveAdmins('shipping.vtp.updated', {
+          provider: 'VTP',
+          source: 'webhook',
+          webhookEventId: id,
+          orderIds: [orderId],
+          occurredAt: new Date().toISOString(),
+        });
+      }
+      return { processed: true, skipped: false };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to process VTP webhook';
+      await this.prisma.shippingWebhookEvent.update({
+        where: { id },
+        data: { errorMessage: message },
+      });
+      this.logger.error(`VTP webhook #${id} failed: ${message}`);
+      return { processed: false, skipped: false, error: message };
+    } finally {
+      await this.redis
+        .getClient()
+        .eval(
+          'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0',
+          1,
+          lockKey,
+          lockValue,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  private async applyVtpWebhookData(data: VtpWebhookData, payloadHash: string) {
+    const trackingNo = this.asString(data.ORDER_NUMBER);
+    const providerOrderId = this.asString(data.ORDER_REFERENCE);
+    const statusCode = this.asNumber(data.ORDER_STATUS);
+    if ((!trackingNo && !providerOrderId) || statusCode === undefined) {
+      throw new BadRequestException('ViettelPost webhook thiếu mã vận đơn hoặc trạng thái');
+    }
+
+    const shippingOrder = await this.prisma.shippingOrder.findFirst({
+      where: {
+        provider: ShippingProvider.VTP,
+        managedBy: ShippingManagedBy.Local,
+        OR: [
+          ...(trackingNo ? [{ trackingNo }] : []),
+          ...(providerOrderId ? [{ providerOrderId }] : []),
+        ],
+      },
+      include: { order: { select: { status: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    const happenedAt = this.vtpDateToDate(data.ORDER_STATUSDATE);
+    const latestEvent = shippingOrder
+      ? await this.prisma.shippingEvent.findFirst({
+          where: { shippingOrderId: shippingOrder.id, provider: ShippingProvider.VTP },
+          orderBy: [{ happenedAt: 'desc' }, { createdAt: 'desc' }],
+        })
+      : null;
+    const pickedUp = shippingOrder
+      ? Boolean(
+          await this.prisma.shippingEvent.findFirst({
+            where: {
+              shippingOrderId: shippingOrder.id,
+              provider: ShippingProvider.VTP,
+              statusCode: '200',
+            },
+            select: { id: true },
+          }),
+        ) || shippingOrder.providerStatusCode === '200'
+      : false;
+    const mapping = mapVtpStatus(statusCode, this.asBoolean(data.IS_RETURNING), pickedUp);
+    const currentCode = this.asNumber(shippingOrder?.providerStatusCode);
+    const currentMapping =
+      currentCode === undefined ? undefined : mapVtpStatus(currentCode, false, pickedUp);
+    const outOfOrder = Boolean(
+      happenedAt && latestEvent?.happenedAt && happenedAt < latestEvent.happenedAt,
+    );
+    const terminalRegression = Boolean(currentMapping?.terminal && !mapping.terminal);
+    const shouldApply = Boolean(shippingOrder && !outOfOrder && !terminalRegression);
+    const previousStatus = shippingOrder?.order.status;
+
+    await this.prisma.$transaction(async (tx) => {
+      if (shippingOrder && shouldApply) {
+        await tx.shippingOrder.update({
+          where: { id: shippingOrder.id },
+          data: {
+            status:
+              mapping.shipmentStatus === 'Cancelled'
+                ? ShippingOrderStatus.Cancelled
+                : mapping.shipmentStatus === 'Failed'
+                  ? ShippingOrderStatus.Failed
+                  : ShippingOrderStatus.Created,
+            ...(trackingNo ? { trackingNo } : {}),
+            ...(providerOrderId ? { providerOrderId } : {}),
+            providerStatus: this.asString(data.STATUS_NAME) ?? mapping.shipmentStatus,
+            providerStatusCode: String(statusCode),
+            providerServiceCode: this.asString(data.ORDER_SERVICE),
+            expectedDelivery: this.asString(data.EXPECTED_DELIVERY),
+            trackingSyncedAt: new Date(),
+            actualFee: Math.round(
+              this.asNumber(data.MONEY_TOTALFEE) ??
+                this.asNumber(data.MONEY_TOTAL) ??
+                Number(shippingOrder.actualFee ?? shippingOrder.estimatedFee ?? 0),
+            ),
+            responsePayload: this.toJson(data),
+            errorMessage: null,
+          },
+        });
+        if (mapping.orderStatus) {
+          await tx.order.updateMany({
+            where: {
+              id: shippingOrder.orderId,
+              ...(mapping.terminal
+                ? {}
+                : { status: { notIn: SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES } }),
+            },
+            data: {
+              ...(trackingNo ? { trackingCode: trackingNo } : {}),
+              status: mapping.orderStatus,
+            },
+          });
+          if (mapping.restoreInventory && previousStatus) {
+            await this.orderInventory.restoreIfFinalCancelled(
+              shippingOrder.orderId,
+              previousStatus,
+              mapping.orderStatus,
+              tx,
+            );
+          }
+        }
+      }
+
+      await tx.shippingEvent.createMany({
+        data: [
+          {
+            shippingOrderId: shippingOrder?.id,
+            provider: ShippingProvider.VTP,
+            providerEventId: `${trackingNo ?? providerOrderId}:${statusCode}:${this.asString(data.ORDER_STATUSDATE) ?? payloadHash.slice(0, 12)}`,
+            trackingNo,
+            providerOrderId,
+            eventType: 'order_status',
+            status: this.asString(data.STATUS_NAME) ?? mapping.shipmentStatus,
+            statusCode: String(statusCode),
+            message:
+              this.asString(data.NOTE) ??
+              this.asString(data.LOCATION_CURRENTLY) ??
+              this.asString(data.LOCALION_CURRENTLY),
+            happenedAt,
+            rawPayload: this.toJson(data),
+          },
+        ],
+        skipDuplicates: true,
+      });
+    });
+
+    if (
+      shippingOrder &&
+      shouldApply &&
+      mapping.restoreInventory &&
+      mapping.orderStatus &&
+      previousStatus
+    ) {
+      await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+        shippingOrder.orderId,
+        previousStatus,
+        mapping.orderStatus,
+      );
+    }
+
+    return shippingOrder && shouldApply ? shippingOrder.orderId : undefined;
   }
 
   private async waitForBatchCreateResult(batchId: number) {
@@ -802,10 +1803,8 @@ export class ShippingService {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async marketplaceSubOrderIds(orderIds: number[]) {
-    const uniqueOrderIds = [...new Set(orderIds)].filter(
-      (id) => Number.isInteger(id) && id > 0,
-    );
+  private async marketplaceOrderMappings(orderIds: number[]) {
+    const uniqueOrderIds = [...new Set(orderIds)].filter((id) => Number.isInteger(id) && id > 0);
     if (!uniqueOrderIds.length) {
       throw new BadRequestException('Vui lòng chọn ít nhất một đơn hàng mua chéo');
     }
@@ -825,8 +1824,45 @@ export class ShippingService {
       if (!order?.marketplaceSubOrderId) {
         throw new BadRequestException(`Đơn #${order?.code ?? orderId} không phải đơn mua chéo`);
       }
-      return order.marketplaceSubOrderId;
+      return { orderId, orderCode: order.code, subOrderId: order.marketplaceSubOrderId };
     });
+  }
+
+  private async marketplaceSubOrderIds(orderIds: number[]) {
+    return (await this.marketplaceOrderMappings(orderIds)).map((item) => item.subOrderId);
+  }
+
+  private enrichMarketplaceShippingResult(
+    rawResult: unknown,
+    mappings: Array<{ orderId: number; orderCode: string; subOrderId: string }>,
+  ): Record<string, unknown> {
+    const result = this.toRecord(rawResult);
+    const failures = Array.isArray(result['failures'])
+      ? result['failures'].map((rawFailure) => {
+          const failure = this.toRecord(rawFailure);
+          const mapping = mappings.find(
+            (item) => item.subOrderId === this.asString(failure['subOrderId']),
+          );
+          return {
+            ...failure,
+            ...(mapping ? { orderId: mapping.orderId, orderCode: mapping.orderCode } : {}),
+          };
+        })
+      : [];
+    const providers = Array.isArray(result['providers'])
+      ? result['providers'].map((rawProvider) => {
+          const provider = this.toRecord(rawProvider);
+          return {
+            ...provider,
+            result: this.enrichMarketplaceShippingResult(provider['result'], mappings),
+          };
+        })
+      : undefined;
+    return {
+      ...result,
+      ...(Array.isArray(result['failures']) ? { failures } : {}),
+      ...(providers ? { providers } : {}),
+    };
   }
 
   private async applySpxWebhookPayload(eventType: string, payload: Record<string, unknown>) {
@@ -999,6 +2035,35 @@ export class ShippingService {
     }
   }
 
+  private hasSpxTrackingStateChanged(
+    shippingOrder: {
+      providerStatus: string | null;
+      providerStatusCode: string | null;
+      trackingNo: string | null;
+      trackingLink: string | null;
+    },
+    previousOrderStatus: OrderStatus | undefined,
+    track: ShippingTrackOrderResult,
+    mappedStatus: OrderStatus | undefined,
+  ) {
+    const canUpdateOrder =
+      Boolean(mappedStatus) &&
+      (mappedStatus === OrderStatus.Cancel ||
+        mappedStatus === OrderStatus.Return ||
+        previousOrderStatus === undefined ||
+        !SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES.includes(
+          previousOrderStatus as (typeof SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES)[number],
+        ));
+
+    return (
+      (track.status !== undefined && shippingOrder.providerStatus !== track.status) ||
+      (track.statusCode !== undefined && shippingOrder.providerStatusCode !== track.statusCode) ||
+      (track.trackingNo !== undefined && shippingOrder.trackingNo !== track.trackingNo) ||
+      (track.trackingLink !== undefined && shippingOrder.trackingLink !== track.trackingLink) ||
+      Boolean(mappedStatus && mappedStatus !== previousOrderStatus && canUpdateOrder)
+    );
+  }
+
   private async applyTrackOrderResult(
     tx: Prisma.TransactionClient,
     shippingOrderId: number,
@@ -1085,8 +2150,9 @@ export class ShippingService {
     dto: CreateOrderDto,
     quoteItems: QuotedOrderItem[],
     payableAmountBeforeDelivery: number,
+    provider: ShippingProvider,
   ): Promise<ShippingOrderDraft> {
-    const recipient = await this.resolveRecipient(tx, dto, dto.paymentMethod);
+    const recipient = await this.resolveRecipient(tx, dto, dto.paymentMethod, provider);
     return this.buildDraft(
       orderId,
       dto.paymentMethod,
@@ -1094,6 +2160,7 @@ export class ShippingService {
       quoteItems,
       recipient,
       payableAmountBeforeDelivery,
+      provider,
     );
   }
 
@@ -1114,6 +2181,7 @@ export class ShippingService {
       ward: string | null;
       fullAddr: string | null;
     },
+    provider: ShippingProvider = ShippingProvider.SPX,
   ) {
     const items: QuotedOrderItem[] = order.orderProducts.map((item) => {
       if (!item.variant) throw new BadRequestException('Đơn hàng có biến thể không hợp lệ');
@@ -1152,8 +2220,9 @@ export class ShippingService {
       order.paymentMethod,
       order.note ?? undefined,
       items,
-      this.mapAddressToParty(address, order.paymentMethod),
+      this.mapAddressToParty(address, order.paymentMethod, provider),
       Number(order.totalAmount),
+      provider,
     );
   }
 
@@ -1164,10 +2233,26 @@ export class ShippingService {
     quoteItems: QuotedOrderItem[],
     recipient: ShippingParty,
     payableAmount: number,
+    provider: ShippingProvider,
   ): ShippingOrderDraft {
-    const parcel = this.buildParcel(quoteItems);
+    const parcel = this.buildParcel(quoteItems, provider);
     const codAmount =
       paymentMethod === PaymentMethod.COD ? Math.max(Math.round(payableAmount), 0) : 0;
+    if (provider === ShippingProvider.VTP) {
+      return {
+        orderId: orderId.slice(0, 100),
+        serviceType: 0,
+        sender: this.resolveSender(provider),
+        recipient,
+        paymentRole: 0,
+        codAmount,
+        collectType: 0,
+        highValueProcessingCollection: 0,
+        note: note?.slice(0, 150),
+        parcel,
+      };
+    }
+
     const collectType = this.configService.get<number>('shipping.spx.collectType') ?? 2;
     const pickupTime = this.configService.get<number>('shipping.spx.pickupTime');
     const pickupTimeRangeId = this.configService.get<number>('shipping.spx.pickupTimeRangeId');
@@ -1183,7 +2268,7 @@ export class ShippingService {
     return {
       orderId: orderId.slice(0, 32),
       serviceType: this.configService.get<number>('shipping.spx.serviceType') ?? 1,
-      sender: this.resolveSender(),
+      sender: this.resolveSender(provider),
       recipient,
       paymentRole: this.configService.get<number>('shipping.spx.paymentRole') ?? 1,
       codAmount,
@@ -1198,7 +2283,7 @@ export class ShippingService {
     };
   }
 
-  private buildParcel(quoteItems: QuotedOrderItem[]) {
+  private buildParcel(quoteItems: QuotedOrderItem[], provider: ShippingProvider) {
     const parcelItems: ShippingParcelItem[] = quoteItems.map((item) => {
       const weight = item.variant.packageWeightGrams ?? 0;
       if (!Number.isFinite(weight) || weight <= 0) {
@@ -1222,7 +2307,7 @@ export class ShippingService {
       0,
     );
     const totalQuantity = quoteItems.reduce((sum, item) => sum + item.quantity, 0);
-    if (totalWeight > SPX_VN_MAX_PARCEL_WEIGHT_GRAMS) {
+    if (provider === ShippingProvider.SPX && totalWeight > SPX_VN_MAX_PARCEL_WEIGHT_GRAMS) {
       throw new BadRequestException(SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE);
     }
 
@@ -1235,7 +2320,10 @@ export class ShippingService {
     const heightCm = this.maxOptionalDimension(
       quoteItems.map((item) => item.variant.packageHeightCm),
     );
-    if ([lengthCm, widthCm, heightCm].every((value) => value !== undefined)) {
+    if (
+      provider === ShippingProvider.SPX &&
+      [lengthCm, widthCm, heightCm].every((value) => value !== undefined)
+    ) {
       const sum = (lengthCm ?? 0) + (widthCm ?? 0) + (heightCm ?? 0);
       if (sum > 180 || [lengthCm, widthCm, heightCm].some((value) => (value ?? 0) > 60)) {
         throw new BadRequestException('Kích thước kiện hàng vượt giới hạn SPX cho Việt Nam');
@@ -1267,21 +2355,33 @@ export class ShippingService {
   private async resolveRecipient(
     tx: Prisma.TransactionClient,
     dto: CreateOrderDto,
-    paymentMethod?: PaymentMethod,
+    paymentMethod: PaymentMethod | undefined,
+    provider: ShippingProvider,
   ) {
-    if (dto.address) return this.mapCheckoutAddressToParty(dto.address, paymentMethod);
+    if (dto.address) return this.mapCheckoutAddressToParty(dto.address, paymentMethod, provider);
     if (!dto.addressId)
       throw new BadRequestException('Thiếu địa chỉ giao hàng để tính phí vận chuyển');
 
     const address = await tx.address.findFirst({ where: { id: dto.addressId, isDeleted: 0 } });
     if (!address) throw new BadRequestException('Không tìm thấy địa chỉ giao hàng');
-    return this.mapAddressToParty(address, paymentMethod);
+    return this.mapAddressToParty(address, paymentMethod, provider);
   }
 
   private mapCheckoutAddressToParty(
     address: NonNullable<CreateOrderDto['address']>,
-    paymentMethod?: PaymentMethod,
+    paymentMethod: PaymentMethod | undefined,
+    provider: ShippingProvider,
   ): ShippingParty {
+    if (provider === ShippingProvider.VTP) {
+      return {
+        name: address.cneeName,
+        phone: address.cneePhone,
+        state: address.city,
+        city: address.ward,
+        district: address.district,
+        detailAddress: address.fullAddr,
+      };
+    }
     const normalized = this.normalizeRecipientAddress(
       address.city,
       address.district,
@@ -1311,8 +2411,19 @@ export class ShippingService {
       ward: string | null;
       fullAddr: string | null;
     },
-    paymentMethod?: PaymentMethod,
+    paymentMethod: PaymentMethod | undefined,
+    provider: ShippingProvider,
   ): ShippingParty {
+    if (provider === ShippingProvider.VTP) {
+      return {
+        name: address.cneeName ?? '',
+        phone: address.cneePhone ?? '',
+        state: address.city ?? '',
+        city: address.ward ?? '',
+        district: address.district ?? '',
+        detailAddress: address.fullAddr ?? '',
+      };
+    }
     const normalized = this.normalizeRecipientAddress(
       address.city,
       address.district,
@@ -1352,7 +2463,24 @@ export class ShippingService {
     return normalized;
   }
 
-  private resolveSender(): ShippingParty {
+  private resolveSender(provider: ShippingProvider): ShippingParty {
+    if (provider === ShippingProvider.VTP) {
+      const sender = this.configService.get<{ name: string; phone: string; address: string }>(
+        'shipping.vtp.sender',
+      );
+      if (!sender?.name || !sender.phone || !sender.address) {
+        throw new BadRequestException('Thiếu cấu hình địa chỉ gửi hàng ViettelPost');
+      }
+      return {
+        name: sender.name,
+        phone: sender.phone,
+        state: '',
+        city: '',
+        district: '',
+        detailAddress: sender.address,
+      };
+    }
+
     const sender = this.configService.get<ShippingParty>('shipping.spx.sender');
     const addressVersion =
       this.configService.get<number>('shipping.spx.addressVersion') === 2 ? 2 : 0;
@@ -1390,6 +2518,82 @@ export class ShippingService {
     return { ...sender, addressVersion: 0 };
   }
 
+  private normalizeShippingCreateResult(
+    rawResult: unknown,
+    provider: ShippingProvider,
+    orderIds: number[],
+    orders: Array<{ id: number; code: string; shippingProvider: ShippingProvider }>,
+  ): Record<string, unknown> {
+    const result = this.toRecord(rawResult);
+    const batch = this.toRecord(result['batch']);
+    const shippingOrders = Array.isArray(result['shippingOrders'])
+      ? result['shippingOrders'].map((item) => this.toRecord(item))
+      : [];
+    const existingFailures = Array.isArray(result['failures']) ? result['failures'] : [];
+    const derivedFailures = shippingOrders
+      .filter((item) => item['status'] === ShippingOrderStatus.Failed)
+      .map((item) => {
+        const orderId = this.asNumber(item['orderId']);
+        const order = orders.find((candidate) => candidate.id === orderId);
+        return {
+          ...(orderId !== undefined ? { orderId } : {}),
+          ...(order?.code ? { orderCode: order.code } : {}),
+          provider,
+          stage: 'create',
+          message: this.asString(item['errorMessage']) ?? 'Đơn vị vận chuyển từ chối yêu cầu',
+          ...(this.asString(item['trackingNo'])
+            ? { trackingNo: this.asString(item['trackingNo']) }
+            : {}),
+        };
+      });
+    const failures = existingFailures.length ? existingFailures : derivedFailures;
+    const failCount =
+      this.asNumber(result['failCount']) ??
+      this.asNumber(batch['failCount']) ??
+      failures.length;
+    const totalCount = this.asNumber(result['totalCount']) ?? orderIds.length;
+    const successCount =
+      this.asNumber(result['successCount']) ??
+      this.asNumber(batch['successCount']) ??
+      Math.max(totalCount - failCount, 0);
+    const trackingNos = Array.isArray(result['trackingNos'])
+      ? result['trackingNos']
+      : shippingOrders
+          .map((item) => this.asString(item['trackingNo']))
+          .filter((value): value is string => Boolean(value));
+    return {
+      ...result,
+      totalCount,
+      successCount,
+      failCount,
+      trackingNos,
+      failures,
+      awbFailures: Array.isArray(result['awbFailures']) ? result['awbFailures'] : [],
+    };
+  }
+
+  private shippingFailuresFromError(
+    error: unknown,
+    provider: ShippingProvider,
+    orderIds: number[],
+    orders: Array<{ id: number; code: string; shippingProvider: ShippingProvider }>,
+  ) {
+    const response = error instanceof HttpException ? this.toRecord(error.getResponse()) : {};
+    const details = this.toRecord(response['details']);
+    const upstreamFailures = Array.isArray(details['failures']) ? details['failures'] : [];
+    if (upstreamFailures.length) return upstreamFailures;
+    const message =
+      this.asString(response['message']) ??
+      (error instanceof Error ? error.message : 'Đơn vị vận chuyển từ chối yêu cầu');
+    return orderIds.map((orderId) => ({
+      orderId,
+      orderCode: orders.find((order) => order.id === orderId)?.code,
+      provider,
+      stage: 'create',
+      message,
+    }));
+  }
+
   private toRecord(payload: unknown): Record<string, unknown> {
     return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
   }
@@ -1413,6 +2617,33 @@ export class ShippingService {
 
   private assertSpxEnabled() {
     if (!this.isSpxEnabled()) throw new BadRequestException('SPX shipping chưa được bật');
+  }
+
+  private assertVtpEnabled() {
+    if (!this.isVtpEnabled()) {
+      throw new BadRequestException('ViettelPost shipping chưa được bật');
+    }
+  }
+
+  private asBoolean(value: unknown) {
+    return value === true || value === 1 || value === '1' || value === 'true';
+  }
+
+  private vtpDateToDate(value: unknown) {
+    const text = this.asString(value);
+    if (!text) return undefined;
+    const vietnamese = text.match(
+      /^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/,
+    );
+    if (vietnamese) {
+      const [, day, month, year, hour = '0', minute = '0', second = '0'] = vietnamese;
+      const parsed = new Date(
+        `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hour.padStart(2, '0')}:${minute.padStart(2, '0')}:${second.padStart(2, '0')}+07:00`,
+      );
+      return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+    }
+    const parsed = new Date(text);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
   }
 
   private toJson(value: unknown): Prisma.InputJsonValue {

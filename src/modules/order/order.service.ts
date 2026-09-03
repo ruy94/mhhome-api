@@ -267,6 +267,23 @@ export class OrderService {
     };
   }
 
+  getShippingProviders() {
+    return [
+      {
+        provider: ShippingProvider.SPX,
+        label: 'SPX Express',
+        enabled: this.shippingService.isProviderEnabled(ShippingProvider.SPX),
+        capabilities: { trackingRefresh: true, editOrder: false, returnDecision: true },
+      },
+      {
+        provider: ShippingProvider.VTP,
+        label: 'ViettelPost',
+        enabled: this.shippingService.isProviderEnabled(ShippingProvider.VTP),
+        capabilities: { trackingRefresh: false, editOrder: true, returnDecision: true },
+      },
+    ].filter((item) => item.enabled);
+  }
+
   private async estimateShippingForPlatform(
     dto: CreateOrderDto,
     voucherConditionType: ConditionType,
@@ -281,17 +298,26 @@ export class OrderService {
         message: 'J&T Express chưa được hỗ trợ',
       };
     }
-    if (provider !== ShippingProvider.SPX) {
+    if (provider !== ShippingProvider.SPX && provider !== ShippingProvider.VTP) {
       throw new BadRequestException('Phương thức vận chuyển không hợp lệ');
+    }
+    if (!this.shippingService.isProviderEnabled(provider)) {
+      return {
+        provider,
+        label: provider === ShippingProvider.VTP ? 'ViettelPost' : 'SPX Express',
+        fee: 0,
+        available: false,
+        message: 'Đơn vị vận chuyển đang tạm ngưng',
+      };
     }
 
     const quote = await this.quoteForPlatform(
-      { ...dto, shippingProvider: ShippingProvider.SPX },
+      { ...dto, shippingProvider: provider },
       voucherConditionType,
     );
     return {
-      provider: ShippingProvider.SPX,
-      label: 'SPX Express',
+      provider,
+      label: provider === ShippingProvider.VTP ? 'ViettelPost' : 'SPX Express',
       fee: quote.deliveryFee,
       available: true,
       shippingQuote: quote.shippingQuote ?? null,
@@ -365,6 +391,10 @@ export class OrderService {
         note: dto.note?.trim() || null,
         invoiceRequest,
         platform,
+        shippingProvider: dto.shippingProvider ?? ShippingProvider.SPX,
+        shippingQuoteSnapshot: quote.shippingQuote
+          ? (quote.shippingQuote as unknown as Prisma.InputJsonObject)
+          : undefined,
         affiliateCode: dto.affiliateCode,
         affiliateProductId: dto.affiliateProductId,
         orderProducts: {

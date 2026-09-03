@@ -14,7 +14,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 
-import { PaymentMethod } from '../../../generated/prisma/enums.js';
+import { PaymentMethod, ShippingProvider } from '../../../generated/prisma/enums.js';
 import { ElectronicInvoiceRequestDto } from '../../order/dto/create-order.dto.js';
 
 export enum MarketplaceQuoteMode {
@@ -202,6 +202,9 @@ export class MarketplaceConfirmReservationDto {
 
   @IsEnum(PaymentMethod)
   paymentMethod!: PaymentMethod;
+
+  @IsEnum(ShippingProvider)
+  shippingProvider!: ShippingProvider;
 }
 
 export enum MarketplaceShipmentStatus {
@@ -224,6 +227,9 @@ export class MarketplaceShipmentEventDto {
   @IsString()
   @IsNotEmpty()
   shipmentId!: string;
+
+  @IsEnum(ShippingProvider)
+  provider!: ShippingProvider;
 
   @IsEnum(MarketplaceShipmentStatus)
   status!: MarketplaceShipmentStatus;

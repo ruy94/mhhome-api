@@ -6,6 +6,7 @@ import {
   OrderStatus,
   PaymentMethod,
   PricingMode,
+  ShippingProvider,
   VoucherScope,
 } from '../../generated/prisma/enums.js';
 jest.mock('../../prisma/prisma.service.js', () => ({ PrismaService: class PrismaService {} }));
@@ -20,10 +21,7 @@ jest.mock('../admin-notification/admin-notification.service.js', () => ({
 }));
 
 import { MarketplaceReservationService } from './marketplace-reservation.service.js';
-import {
-  MarketplaceQuoteMode,
-  MarketplaceShipmentStatus,
-} from './dto/marketplace-commerce.dto.js';
+import { MarketplaceQuoteMode, MarketplaceShipmentStatus } from './dto/marketplace-commerce.dto.js';
 
 describe('MarketplaceReservationService', () => {
   const tx = {
@@ -71,12 +69,16 @@ describe('MarketplaceReservationService', () => {
     exportOrderStock: jest.fn(),
     returnOrderStockIfFinalCancelled: jest.fn(),
   };
+  const adminNotifications = {
+    notifyOrderCreated: jest.fn(),
+    publishRealtimeToActiveAdmins: jest.fn().mockResolvedValue(undefined),
+  };
   const service = new MarketplaceReservationService(
     prisma as never,
     commerce as never,
     catalog as never,
     saleWorkStockSync as never,
-    { notifyOrderCreated: jest.fn() } as never,
+    adminNotifications as never,
     { reservationTtlSeconds: 300 } as never,
   );
 
@@ -204,6 +206,7 @@ describe('MarketplaceReservationService', () => {
         detailAddress: 'Sender address',
       },
       paymentMethod: PaymentMethod.COD,
+      shippingProvider: ShippingProvider.SPX,
     });
 
     expect(tx.order.create).toHaveBeenCalledWith(
@@ -283,6 +286,7 @@ describe('MarketplaceReservationService', () => {
     const result = await service.applyShipmentEvent('sub-order-1', {
       eventId: 1,
       shipmentId: 'shipment-1',
+      provider: ShippingProvider.SPX,
       status: MarketplaceShipmentStatus.Returned,
     });
 
@@ -290,6 +294,45 @@ describe('MarketplaceReservationService', () => {
     expect(tx.shippingOrder.upsert).not.toHaveBeenCalled();
     expect(tx.variant.update).not.toHaveBeenCalled();
     expect(saleWorkStockSync.returnOrderStockIfFinalCancelled).not.toHaveBeenCalled();
+    expect(adminNotifications.publishRealtimeToActiveAdmins).toHaveBeenCalledWith(
+      'shipping.spx.updated',
+      expect.objectContaining({
+        provider: ShippingProvider.SPX,
+        source: 'marketplace_callback',
+        orderIds: [19],
+        marketplaceSubOrderId: 'sub-order-1',
+        marketplaceShipmentId: 'shipment-1',
+      }),
+    );
+  });
+
+  it('publishes VTP marketplace callbacks without failing when realtime is unavailable', async () => {
+    tx.order.findUnique.mockResolvedValue({
+      id: 19,
+      status: OrderStatus.Delivering,
+      marketplaceReservation: { id: 'reservation-1' },
+    });
+    tx.shippingEvent.findUnique.mockResolvedValue({ id: 92 });
+    adminNotifications.publishRealtimeToActiveAdmins.mockRejectedValueOnce(
+      new Error('Redis unavailable'),
+    );
+
+    await expect(
+      service.applyShipmentEvent('sub-order-1', {
+        eventId: 2,
+        shipmentId: 'shipment-2',
+        provider: ShippingProvider.VTP,
+        status: MarketplaceShipmentStatus.Cancelled,
+      }),
+    ).resolves.toEqual({ received: true, duplicate: true, orderId: 19 });
+    expect(adminNotifications.publishRealtimeToActiveAdmins).toHaveBeenCalledWith(
+      'shipping.vtp.updated',
+      expect.objectContaining({
+        provider: ShippingProvider.VTP,
+        orderIds: [19],
+        marketplaceShipmentId: 'shipment-2',
+      }),
+    );
   });
 
   it('maps Returning to delivery progress and Returned to the terminal return status', () => {
@@ -305,21 +348,61 @@ describe('MarketplaceReservationService', () => {
     );
   });
   it('refunds a confirmed source order and restores local and SaleWork stock once', async () => {
-    tx.order.findUnique.mockResolvedValue({ id: 19, status: OrderStatus.Paid, marketplaceReservation: { id: 'reservation-1', status: MarketplaceReservationStatus.Confirmed } });
-    tx.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({ id: 'reservation-1', status: MarketplaceReservationStatus.Confirmed, inventoryItems: [{ productId: 1, variantId: 11, quantity: 2, flashSaleItemId: null }], vouchers: [], order: { id: 19, status: OrderStatus.Paid } });
-    prisma.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({ id: 'reservation-1', checkoutSessionId: 'session-1', status: MarketplaceReservationStatus.Refunded, expiresAt: new Date(Date.now() + 60_000), quoteSnapshot: {}, order: { id: 19, code: 'ORD19', status: OrderStatus.Refund } });
+    tx.order.findUnique.mockResolvedValue({
+      id: 19,
+      status: OrderStatus.Paid,
+      marketplaceReservation: {
+        id: 'reservation-1',
+        status: MarketplaceReservationStatus.Confirmed,
+      },
+    });
+    tx.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({
+      id: 'reservation-1',
+      status: MarketplaceReservationStatus.Confirmed,
+      inventoryItems: [{ productId: 1, variantId: 11, quantity: 2, flashSaleItemId: null }],
+      vouchers: [],
+      order: { id: 19, status: OrderStatus.Paid },
+    });
+    prisma.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({
+      id: 'reservation-1',
+      checkoutSessionId: 'session-1',
+      status: MarketplaceReservationStatus.Refunded,
+      expiresAt: new Date(Date.now() + 60_000),
+      quoteSnapshot: {},
+      order: { id: 19, code: 'ORD19', status: OrderStatus.Refund },
+    });
 
     const result = await service.refundOrder('sub-order-1', 'Customer refund');
 
     expect(result.status).toBe(MarketplaceReservationStatus.Refunded);
-    expect(tx.variant.update).toHaveBeenCalledWith({ where: { id: 11 }, data: { stock: { increment: 2 } } });
-    expect(tx.order.update).toHaveBeenCalledWith({ where: { id: 19 }, data: { status: OrderStatus.Refund } });
+    expect(tx.variant.update).toHaveBeenCalledWith({
+      where: { id: 11 },
+      data: { stock: { increment: 2 } },
+    });
+    expect(tx.order.update).toHaveBeenCalledWith({
+      where: { id: 19 },
+      data: { status: OrderStatus.Refund },
+    });
     expect(saleWorkStockSync.returnOrderStockIfFinalCancelled).toHaveBeenCalledTimes(1);
   });
 
   it('acknowledges a repeated refund without restoring stock again', async () => {
-    tx.order.findUnique.mockResolvedValue({ id: 19, status: OrderStatus.Refund, marketplaceReservation: { id: 'reservation-1', status: MarketplaceReservationStatus.Refunded } });
-    prisma.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({ id: 'reservation-1', checkoutSessionId: 'session-1', status: MarketplaceReservationStatus.Refunded, expiresAt: new Date(Date.now() + 60_000), quoteSnapshot: {}, order: { id: 19, code: 'ORD19', status: OrderStatus.Refund } });
+    tx.order.findUnique.mockResolvedValue({
+      id: 19,
+      status: OrderStatus.Refund,
+      marketplaceReservation: {
+        id: 'reservation-1',
+        status: MarketplaceReservationStatus.Refunded,
+      },
+    });
+    prisma.marketplaceCheckoutReservation.findUniqueOrThrow.mockResolvedValue({
+      id: 'reservation-1',
+      checkoutSessionId: 'session-1',
+      status: MarketplaceReservationStatus.Refunded,
+      expiresAt: new Date(Date.now() + 60_000),
+      quoteSnapshot: {},
+      order: { id: 19, code: 'ORD19', status: OrderStatus.Refund },
+    });
 
     await service.refundOrder('sub-order-1');
 

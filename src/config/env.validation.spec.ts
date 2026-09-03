@@ -97,3 +97,31 @@ describe('validateEnv boolean flags', () => {
     ).toThrow('MARKETPLACE_CHECKOUT_ENABLED requires MARKETPLACE_ENABLED=true');
   });
 });
+
+describe('validateEnv VTP Partner credentials', () => {
+  const vtpEnv = {
+    VTP_ENABLED: 'true',
+    VTP_USERNAME: 'partner-user',
+    VTP_PASSWORD: 'partner-password',
+    VTP_WEBHOOK_SECRET: 'webhook-secret',
+    VTP_SENDER_NAME: 'Shop Test',
+    VTP_SENDER_PHONE: '0900000000',
+    VTP_SENDER_ADDRESS: '123 Đường A',
+  };
+
+  it('accepts username and password when VTP is enabled', () => {
+    expect(() => validateEnv({ ...requiredEnv, ...vtpEnv })).not.toThrow();
+  });
+
+  it('does not accept the legacy secret token in place of Partner credentials', () => {
+    const { VTP_USERNAME: _username, VTP_PASSWORD: _password, ...withoutCredentials } = vtpEnv;
+
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...withoutCredentials,
+        VTP_SECRET_TOKEN: 'legacy-secret-token',
+      }),
+    ).toThrow('VTP_USERNAME');
+  });
+});

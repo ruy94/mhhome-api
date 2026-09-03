@@ -7,6 +7,6 @@ import { AdminNotificationService } from './admin-notification.service.js';
 @Module({
   controllers: [AdminNotificationController],
   providers: [AdminNotificationRealtimeService, AdminNotificationService],
-  exports: [AdminNotificationService],
+  exports: [AdminNotificationService, AdminNotificationRealtimeService],
 })
 export class AdminNotificationModule {}

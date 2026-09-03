@@ -20,6 +20,8 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
     let message: string | string[] = 'Internal server error';
     let error = 'Error';
+    let code: string | undefined;
+    let details: unknown;
 
     if (exception instanceof HttpException) {
       status = exception.getStatus();
@@ -33,6 +35,8 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         const raw = b['message'];
         message = Array.isArray(raw) ? (raw[0] as string) : ((raw as string) ?? message);
         error = (b['error'] as string) ?? exception.name;
+        code = typeof b['code'] === 'string' ? b['code'] : undefined;
+        details = b['details'];
       }
     } else if (this.getStatus(exception) === HttpStatus.PAYLOAD_TOO_LARGE) {
       status = HttpStatus.PAYLOAD_TOO_LARGE;
@@ -49,6 +53,8 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       error,
       timestamp: new Date().toISOString(),
       path: request.url,
+      ...(code ? { code } : {}),
+      ...(details !== undefined ? { details } : {}),
     });
   }
 

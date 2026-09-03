@@ -19,6 +19,7 @@ import {
   MarketplaceVoucherSelectionMode,
 } from './marketplace-commerce.dto.js';
 import { ElectronicInvoiceRequestDto } from '../../order/dto/create-order.dto.js';
+import { ShippingProvider } from '../../../generated/prisma/enums.js';
 
 export class AddMarketplaceCartItemDto {
   @IsUUID()
@@ -110,6 +111,10 @@ export class MarketplaceSourceVoucherGroupDto extends MarketplaceSourceVoucherSe
 }
 
 export class MarketplaceCheckoutQuoteDto {
+  @IsOptional()
+  @IsEnum(ShippingProvider)
+  shippingProvider?: ShippingProvider;
+
   @IsInt()
   @Min(1)
   userId!: number;

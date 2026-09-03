@@ -10,7 +10,10 @@ import {
 } from '../../generated/prisma/enums.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { AdminNotificationRealtimeService } from './admin-notification-realtime.service.js';
-import type { CreateAdminNotificationInput } from './admin-notification.types.js';
+import type {
+  AdminNotificationEventEnvelope,
+  CreateAdminNotificationInput,
+} from './admin-notification.types.js';
 
 const INBOX_MODES = [
   AdminNotificationDeliveryMode.Inbox,
@@ -107,6 +110,23 @@ export class AdminNotificationService {
       data: payload,
     });
     return payload;
+  }
+
+  /** Publishes a transient operational event without creating an inbox notification. */
+  async publishRealtimeToActiveAdmins(
+    event: Exclude<AdminNotificationEventEnvelope['event'], `notification.${string}`>,
+    data: object,
+  ): Promise<void> {
+    const admins = await this.prisma.admin.findMany({
+      where: { isActive: true },
+      select: { id: true },
+    });
+    if (!admins.length) return;
+    await this.publishSafely({
+      adminIds: admins.map((admin) => admin.id),
+      event,
+      data,
+    });
   }
 
   async notifyOrderCreated(order: {

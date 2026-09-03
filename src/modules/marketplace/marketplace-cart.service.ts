@@ -2,7 +2,7 @@ import { BadRequestException, Inject, Injectable, NotFoundException } from '@nes
 import { ConfigType } from '@nestjs/config';
 
 import marketplaceConfig from '../../config/marketplace.config.js';
-import { OrderPlatform, Prisma } from '../../generated/prisma/client.js';
+import { OrderPlatform, Prisma, ShippingProvider } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { normalizeSpxAddress } from '../shipping/spx-address-normalizer.js';
 import type {
@@ -252,9 +252,18 @@ export class MarketplaceCartService {
         })
       : null;
     if (dto.addressId && !address) throw new BadRequestException('Địa chỉ giao hàng không hợp lệ');
-    const normalized = address
-      ? normalizeSpxAddress(address.city, address.district, address.ward)
-      : null;
+    const provider = dto.shippingProvider ?? ShippingProvider.SPX;
+    const normalized =
+      address && provider === ShippingProvider.SPX
+        ? normalizeSpxAddress(address.city, address.district, address.ward)
+        : address
+          ? {
+              state: address.city ?? '',
+              city: address.ward ?? '',
+              district: address.district ?? undefined,
+              addressVersion: 2 as const,
+            }
+          : null;
     if (address && !normalized) {
       throw new BadRequestException('Địa chỉ giao hàng đã cũ, vui lòng cập nhật lại');
     }
@@ -284,6 +293,7 @@ export class MarketplaceCartService {
     ];
     return {
       hostLocalUserId: dto.userId,
+      shippingProvider: provider,
       opaqueCustomerRef: identity.id,
       ...(address && normalized
         ? {

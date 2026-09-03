@@ -50,10 +50,13 @@ export interface ShippingOrderDraft {
 }
 
 export interface ShippingEstimateResult {
-  provider: 'SPX';
+  provider: 'SPX' | 'VTP';
   providerOrderId: string;
   estimatedFee: number;
   basicFee: number;
+  serviceCode?: string;
+  serviceName?: string;
+  expectedDelivery?: string;
   raw: unknown;
 }
 

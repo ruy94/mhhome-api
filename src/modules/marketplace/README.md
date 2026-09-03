@@ -47,8 +47,10 @@ MARKETPLACE_MEDIA_THUMBNAIL_BASE_URL=https://media.shop.example.com/thumbnails
 - Khi chỉ `MARKETPLACE_CHECKOUT_ENABLED=false`, catalog, giỏ/đơn cũ và thao tác
   xóa giỏ vẫn dùng được; add/update, quote và prepare mới bị chặn. Session đang
   tồn tại vẫn được get/confirm/release để không bỏ dở reservation.
-- Khi bật checkout, sender profile SPX của shop phải đầy đủ. Marketplace dùng
-  sender snapshot này cho parcel của shop nhưng dùng SPX account trung tâm.
+- Khi bật checkout, sender profile của shop phải đầy đủ. Marketplace lưu một
+  sender snapshot dùng chung cho parcel của source và dùng credential trung tâm
+  của carrier được chọn. Shop chỉ bật VTP sẽ phát profile từ cấu hình VTP; khi
+  SPX cùng bật, profile SPX là địa chỉ lấy hàng dùng chung cho cả hai carrier.
 - Ba media base URL là bắt buộc khi Marketplace bật. Shop API phải chuyển mọi
   filename/path tương đối thành URL tuyệt đối trước khi phát catalog. URL đã
   tuyệt đối được giữ nguyên.
@@ -140,18 +142,18 @@ Order mua chéo không nằm chung màn vận hành với order local:
 - Shop Admin dùng `/marketplace-orders` và chỉ thấy sub-order có sản phẩm thuộc
   shop hiện tại.
 - Order bắt đầu ở `Chờ xử lý`; Marketplace chỉ khởi tạo shipment `Pending`,
-  không tự động gửi SPX ngay sau checkout.
+  không tự động gửi sang đơn vị vận chuyển ngay sau checkout.
 - Source operator chọn đơn và gọi
   `POST /api/v1/shipping/marketplace/orders/batch`.
-- Shop API chuyển sub-order ID tới Marketplace. Marketplace dùng
-  `SPX_USER_ID/SPX_USER_SECRET` trung tâm và sender snapshot của source để tạo
-  SPX parcel, rồi trả tracking/AWB về Shop Admin.
+- Shop API chuyển sub-order ID tới Marketplace. Marketplace dùng credential
+  SPX hoặc VTP trung tâm cùng sender snapshot của source để tạo parcel, rồi trả
+  tracking/AWB về Shop Admin.
 - In hoặc in lại dùng `POST /api/v1/shipping/marketplace/orders/awb`.
-- Refresh tracking và cancel dùng các endpoint
-  `/api/v1/shipping/marketplace/orders/...` tương ứng.
+- Cancel dùng endpoint `/api/v1/shipping/marketplace/orders/...` tương ứng.
+  Refresh thủ công chỉ dành cho SPX; VTP đồng bộ qua webhook.
 
-Marketplace nhận SPX webhook và callback trạng thái về source. Detail/list API
-phải trả shipping events để Admin và Mini App hiển thị hành trình mới nhất.
+Marketplace nhận webhook SPX/VTP và callback trạng thái về source. Detail/list
+API phải trả shipping events để Admin và Mini App hiển thị hành trình mới nhất.
 
 ## Trạng Thái Và Hoàn Kho
 

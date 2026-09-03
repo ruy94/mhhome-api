@@ -19,10 +19,7 @@ import type { Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { SaleWorkStockSyncService } from '../salework-sync/salework-stock-sync.service.js';
 import { generateOrderCode } from '../order/order-code.js';
-import {
-  MarketplaceQuoteMode,
-  MarketplaceShipmentStatus,
-} from './dto/marketplace-commerce.dto.js';
+import { MarketplaceQuoteMode, MarketplaceShipmentStatus } from './dto/marketplace-commerce.dto.js';
 import type {
   MarketplaceConfirmReservationDto,
   MarketplaceShipmentEventDto,
@@ -188,9 +185,7 @@ export class MarketplaceReservationService {
             fullAddr: dto.recipient.detailAddress,
           },
         });
-        const orderVoucher = reservation.vouchers.find(
-          (item) => item.scope === VoucherScope.Order,
-        );
+        const orderVoucher = reservation.vouchers.find((item) => item.scope === VoucherScope.Order);
         const shippingVoucher = reservation.vouchers.find(
           (item) => item.scope === VoucherScope.Shipping,
         );
@@ -204,8 +199,7 @@ export class MarketplaceReservationService {
             productVoucherId: orderVoucher?.voucherId ?? null,
             deliveryVoucherId: shippingVoucher?.voucherId ?? null,
             estAmount:
-              Number(reservation.merchandiseSubtotal) -
-              Number(reservation.itemVoucherDiscount),
+              Number(reservation.merchandiseSubtotal) - Number(reservation.itemVoucherDiscount),
             itemVoucherDiscount: reservation.itemVoucherDiscount,
             productDiscount: reservation.orderVoucherDiscount,
             deliveryFee: reservation.shippingFee,
@@ -218,6 +212,7 @@ export class MarketplaceReservationService {
               ? { invoiceRequest: dto.invoiceRequest as unknown as Prisma.InputJsonValue }
               : {}),
             platform: OrderPlatform.Marketplace,
+            shippingProvider: dto.shippingProvider,
             marketplaceParentId: dto.parentOrderId,
             marketplaceSubOrderId: dto.subOrderId,
             marketplaceReservationId: reservation.id,
@@ -247,9 +242,7 @@ export class MarketplaceReservationService {
                   flashSaleType: this.optionalDiscountType(snapshot.flashSaleType),
                   flashSaleValue: this.optionalNumber(snapshot.flashSaleValue),
                   itemVoucherId: itemVoucher?.voucherId ?? null,
-                  itemVoucherType: this.optionalDiscountType(
-                    voucherSnapshot?.discountType,
-                  ),
+                  itemVoucherType: this.optionalDiscountType(voucherSnapshot?.discountType),
                   itemVoucherValue: this.optionalNumber(voucherSnapshot?.discountValue),
                   itemVoucherDiscount: itemVoucherAllocations.get(item.id) ?? 0,
                 };
@@ -320,9 +313,7 @@ export class MarketplaceReservationService {
   }
 
   async compensate(id: string) {
-    let cancelledOrder:
-      | { id: number; previousStatus: OrderStatus }
-      | null = null;
+    let cancelledOrder: { id: number; previousStatus: OrderStatus } | null = null;
     await this.prisma.$transaction(
       async (tx) => {
         const reservation = await this.findForUpdate(tx, id);
@@ -353,9 +344,7 @@ export class MarketplaceReservationService {
       },
       { isolationLevel: 'Serializable' },
     );
-    const orderToReturn = cancelledOrder as
-      | { id: number; previousStatus: OrderStatus }
-      | null;
+    const orderToReturn = cancelledOrder as { id: number; previousStatus: OrderStatus } | null;
     if (orderToReturn) {
       await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
         orderToReturn.id,
@@ -365,7 +354,6 @@ export class MarketplaceReservationService {
     }
     return this.get(id);
   }
-
 
   async refundOrder(subOrderId: string, reason?: string) {
     let reservationId: string | null = null;
@@ -400,7 +388,11 @@ export class MarketplaceReservationService {
         if (reason?.trim()) {
           await tx.order.update({
             where: { id: order.id },
-            data: { note: order.note ? `${order.note}\nRefund: ${reason.trim()}` : `Refund: ${reason.trim()}` },
+            data: {
+              note: order.note
+                ? `${order.note}\nRefund: ${reason.trim()}`
+                : `Refund: ${reason.trim()}`,
+            },
           });
         }
       },
@@ -419,7 +411,8 @@ export class MarketplaceReservationService {
   }
 
   async applyShipmentEvent(subOrderId: string, dto: MarketplaceShipmentEventDto) {
-    let stockReturn: { id: number; previousStatus: OrderStatus; nextStatus: OrderStatus } | null = null;
+    let stockReturn: { id: number; previousStatus: OrderStatus; nextStatus: OrderStatus } | null =
+      null;
     const result = await this.prisma.$transaction(
       async (tx) => {
         const order = await tx.order.findUnique({
@@ -434,7 +427,7 @@ export class MarketplaceReservationService {
         const duplicate = await tx.shippingEvent.findUnique({
           where: {
             provider_providerEventId: {
-              provider: ShippingProvider.SPX,
+              provider: dto.provider,
               providerEventId,
             },
           },
@@ -446,7 +439,7 @@ export class MarketplaceReservationService {
           where: { marketplaceShipmentId: dto.shipmentId },
           create: {
             orderId: order.id,
-            provider: ShippingProvider.SPX,
+            provider: dto.provider,
             status: shippingStatus,
             managedBy: ShippingManagedBy.Marketplace,
             marketplaceShipmentId: dto.shipmentId,
@@ -459,6 +452,7 @@ export class MarketplaceReservationService {
             responsePayload: this.json(dto.rawPayload ?? dto),
           },
           update: {
+            provider: dto.provider,
             status: shippingStatus,
             providerOrderId: dto.providerOrderId ?? undefined,
             trackingNo: dto.trackingNo ?? undefined,
@@ -477,7 +471,7 @@ export class MarketplaceReservationService {
         await tx.shippingEvent.create({
           data: {
             shippingOrderId: shippingOrder.id,
-            provider: ShippingProvider.SPX,
+            provider: dto.provider,
             providerEventId,
             trackingNo: dto.trackingNo ?? shippingOrder.trackingNo,
             providerOrderId: dto.providerOrderId ?? shippingOrder.providerOrderId,
@@ -505,7 +499,11 @@ export class MarketplaceReservationService {
             dto.status === MarketplaceShipmentStatus.Returned
               ? OrderStatus.Return
               : OrderStatus.Cancel;
-          stockReturn = { id: order.id, previousStatus: order.status, nextStatus: terminalOrderStatus };
+          stockReturn = {
+            id: order.id,
+            previousStatus: order.status,
+            nextStatus: terminalOrderStatus,
+          };
           await this.restoreConfirmed(tx, reservation, terminalStatus, terminalOrderStatus);
         } else if (
           nextOrderStatus &&
@@ -520,7 +518,10 @@ export class MarketplaceReservationService {
             },
           });
         } else if (dto.trackingNo && order.trackingCode !== dto.trackingNo) {
-          await tx.order.update({ where: { id: order.id }, data: { trackingCode: dto.trackingNo } });
+          await tx.order.update({
+            where: { id: order.id },
+            data: { trackingCode: dto.trackingNo },
+          });
         }
 
         return { received: true, duplicate: false, orderId: order.id };
@@ -528,9 +529,11 @@ export class MarketplaceReservationService {
       { isolationLevel: 'Serializable' },
     );
 
-    const returnTransition = stockReturn as
-      | { id: number; previousStatus: OrderStatus; nextStatus: OrderStatus }
-      | null;
+    const returnTransition = stockReturn as {
+      id: number;
+      previousStatus: OrderStatus;
+      nextStatus: OrderStatus;
+    } | null;
     if (returnTransition) {
       await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
         returnTransition.id,
@@ -538,6 +541,18 @@ export class MarketplaceReservationService {
         returnTransition.nextStatus,
       );
     }
+    const realtimeEvent =
+      dto.provider === ShippingProvider.VTP ? 'shipping.vtp.updated' : 'shipping.spx.updated';
+    await this.adminNotifications
+      .publishRealtimeToActiveAdmins(realtimeEvent, {
+        provider: dto.provider,
+        source: 'marketplace_callback',
+        orderIds: [result.orderId],
+        marketplaceSubOrderId: subOrderId,
+        marketplaceShipmentId: dto.shipmentId,
+        occurredAt: new Date().toISOString(),
+      })
+      .catch(() => undefined);
     return result;
   }
 

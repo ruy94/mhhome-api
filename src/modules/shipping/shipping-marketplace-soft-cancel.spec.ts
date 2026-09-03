@@ -16,11 +16,14 @@ jest.mock('../../generated/prisma/client.js', () => ({
     Failed: 'Failed',
     Cancelled: 'Cancelled',
   },
-  ShippingProvider: { SPX: 'SPX', JNT: 'JNT' },
+  ShippingProvider: { SPX: 'SPX', VTP: 'VTP', JNT: 'JNT' },
 }));
 jest.mock('../../prisma/prisma.service.js', () => ({ PrismaService: class {} }));
 jest.mock('../integrations/shipping/spx/spx-shipping-client.service.js', () => ({
   SpxShippingClientService: class {},
+}));
+jest.mock('../integrations/shipping/vtp/vtp-shipping-client.service.js', () => ({
+  VtpShippingClientService: class {},
 }));
 jest.mock('../salework-sync/salework-stock-sync.service.js', () => ({
   SaleWorkStockSyncService: class {},
@@ -70,6 +73,9 @@ describe('ShippingService marketplace soft cancellation', () => {
     };
     const service = new ShippingService(
       prisma as never,
+      {} as never,
+      {} as never,
+      {} as never,
       {} as never,
       {} as never,
       {} as never,

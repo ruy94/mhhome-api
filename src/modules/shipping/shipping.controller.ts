@@ -1,4 +1,4 @@
-import { Body, Controller, Param, ParseIntPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Param, ParseIntPipe, Patch, Post, UseGuards } from '@nestjs/common';
 
 import { RequirePermissions } from '../../common/decorators/permissions.decorator.js';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
@@ -8,11 +8,19 @@ import { ConfirmSpxOrderDto } from './dto/confirm-spx-order.dto.js';
 import { BatchSpxOrdersDto } from './dto/batch-spx-orders.dto.js';
 import { GetShippingAwbDto } from './dto/get-shipping-awb.dto.js';
 import { RefreshSpxTrackingsDto } from './dto/refresh-spx-trackings.dto.js';
+import { UpdateVtpShippingOrderDto } from './dto/update-vtp-shipping-order.dto.js';
+import { VtpStatusActionDto } from './dto/vtp-status-action.dto.js';
 
 @Controller('shipping')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 export class ShippingController {
   constructor(private readonly shippingService: ShippingService) {}
+
+  @Post('orders/batch')
+  @RequirePermissions('order:update_tracking')
+  createOrders(@Body() dto: BatchSpxOrdersDto) {
+    return this.shippingService.createOrders(dto.orderIds);
+  }
 
   @Post('spx/orders/batch')
   @RequirePermissions('order:update_tracking')
@@ -68,6 +76,38 @@ export class ShippingController {
     return this.shippingService.getAwbForOrders(dto);
   }
 
+  @Patch('orders/:orderId')
+  @RequirePermissions('order:update_tracking')
+  updateVtpShippingOrder(
+    @Param('orderId', ParseIntPipe) orderId: number,
+    @Body() dto: UpdateVtpShippingOrderDto,
+  ) {
+    return this.shippingService.updateVtpShippingOrder(orderId, {
+      recipient: {
+        name: dto.recipientName,
+        phone: dto.recipientPhone,
+        address: dto.recipientAddress,
+      },
+      weightGrams: dto.weightGrams,
+      lengthCm: dto.lengthCm,
+      widthCm: dto.widthCm,
+      heightCm: dto.heightCm,
+      pickupDate: dto.pickupDate,
+      pickupCode: dto.pickupCode,
+      deliveryCode: dto.deliveryCode,
+      note: dto.note,
+    });
+  }
+
+  @Post('orders/:orderId/vtp-status-actions')
+  @RequirePermissions('order:update_status')
+  updateVtpStatusAction(
+    @Param('orderId', ParseIntPipe) orderId: number,
+    @Body() dto: VtpStatusActionDto,
+  ) {
+    return this.shippingService.updateVtpStatusAction(orderId, dto.type, dto.note);
+  }
+
   @Post('orders/:orderId/cancel')
   @RequirePermissions('order:update_tracking')
   cancelShippingOrder(@Param('orderId', ParseIntPipe) orderId: number) {
@@ -105,6 +145,12 @@ export class ShippingController {
     @Body() dto: ConfirmSpxOrderDto,
   ) {
     return this.shippingService.confirmSpxOrder(orderId, dto.operation);
+  }
+
+  @Post('webhooks/vtp/:id/retry')
+  @RequirePermissions('order:update_tracking')
+  retryVtpWebhook(@Param('id', ParseIntPipe) id: number) {
+    return this.shippingService.retryVtpWebhookEvent(id);
   }
 
   @Post('spx/pickup-timeslots')

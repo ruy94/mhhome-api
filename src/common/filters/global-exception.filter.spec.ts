@@ -1,4 +1,4 @@
-import { ArgumentsHost, HttpStatus } from '@nestjs/common';
+import { ArgumentsHost, BadGatewayException, HttpStatus } from '@nestjs/common';
 
 import { GlobalExceptionFilter } from './global-exception.filter.js';
 
@@ -34,6 +34,26 @@ describe('GlobalExceptionFilter', () => {
         statusCode: HttpStatus.PAYLOAD_TOO_LARGE,
         message: 'Dữ liệu gửi lên vượt quá giới hạn cho phép',
         error: 'Payload Too Large',
+      }),
+    );
+  });
+
+  it('preserves safe structured error details', () => {
+    const { host, response } = createHost();
+
+    const exception = new BadGatewayException({
+      message: 'Không thể tạo vận đơn',
+      error: 'Bad Gateway',
+      code: 'VTP_SHIPPING_FAILED',
+      details: { failCount: 1 },
+    });
+
+    new GlobalExceptionFilter().catch(exception, host);
+
+    expect(response.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'VTP_SHIPPING_FAILED',
+        details: { failCount: 1 },
       }),
     );
   });
