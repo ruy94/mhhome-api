@@ -1,0 +1,36 @@
+# Project identity, operator tools and generated/runtime data are never copied.
+/.git/***
+/.env*
+/.github/***
+/.gitignore
+/.dockerignore
+/docker-compose*.yml
+/ecosystem.config.*
+/AGENTS.md
+/CLAUDE.md
+/README.md
+/DEPLOYMENT.md
+/ops/***
+/scripts/***
+/node_modules/***
+/dist/***
+/build/***
+/coverage/***
+/.nuxt/***
+/.output/***
+/.nitro/***
+/.cache/***
+/logs/***
+/uploads/***
+/backups/***
+/migration-artifacts/***
+/src/generated/***
+*.log
+*.tsbuildinfo
+
+# Permanent MH Home SEO and curated brand assets.
+/nuxt.config.ts
+/public/logo/***
+/public/home/***
+/Dockerfile
+/nginx.conf

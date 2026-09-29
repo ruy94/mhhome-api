@@ -1,0 +1,43 @@
+# Project identity, operator tools and generated/runtime data are never copied.
+/.git/***
+/.env*
+/.github/***
+/.gitignore
+/.dockerignore
+/docker-compose*.yml
+/ecosystem.config.*
+/AGENTS.md
+/CLAUDE.md
+/README.md
+/DEPLOYMENT.md
+/ops/***
+/scripts/***
+/node_modules/***
+/dist/***
+/build/***
+/coverage/***
+/.nuxt/***
+/.output/***
+/.nitro/***
+/.cache/***
+/logs/***
+/uploads/***
+/backups/***
+/migration-artifacts/***
+/src/generated/***
+*.log
+*.tsbuildinfo
+
+# Permanent MH Home identity.
+/index.html
+/public/logo.png
+/src/assets/logo.png
+# Temporary until the separate KiotViet/business synchronization.
+/src/components/AppSidebar.vue
+/src/config/features.ts
+/src/router/index.ts
+/src/types/api.ts
+/src/services/api/kiotviet.service.ts
+/src/services/api/order.service.ts
+/src/views/warehouses/kiotviet/***
+/src/views/orders/***

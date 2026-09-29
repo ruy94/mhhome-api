@@ -24,9 +24,11 @@ export class UploadController {
   @UseGuards(JwtAuthGuard, PermissionsGuard)
   @RequirePermissions('upload:create')
   @UseInterceptors(FilesInterceptor('files', 10, imageUploadOptions))
-  uploadMultipleImages(@UploadedFiles() files: Array<Express.Multer.File>) {
-    const urls = files.map((file) => file.filename);
-    return { message: 'Images uploaded successfully', urls };
+  async uploadMultipleImages(@UploadedFiles() files: Array<Express.Multer.File>) {
+    if (!files || files.length === 0) {
+      throw new BadRequestException('No files uploaded');
+    }
+    return await this.uploadService.processImages(files);
   }
 
   @Post('video')

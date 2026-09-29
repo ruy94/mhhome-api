@@ -76,7 +76,7 @@ export class VariantService {
     });
 
     if (variant.image && nextImage !== variant.image) {
-      await this.uploadService.deleteImage(variant.image);
+      await this.uploadService.enqueueImageCleanup(variant.image);
     }
     return updatedVariant;
   }

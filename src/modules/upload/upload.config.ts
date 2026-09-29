@@ -1,14 +1,12 @@
 import { randomBytes } from 'crypto';
+import { mkdirSync } from 'fs';
 import moment from 'moment';
 import { basename, extname } from 'path';
 import { diskStorage } from 'multer';
 
-const isProduction = process.env.NODE_ENV === 'production';
+export const UPLOAD_TEMP_DIR = process.env.UPLOAD_TEMP_DIR ?? '/tmp/mhhome-api/uploads';
 
-export const IMAGE_DEST = isProduction ? '/var/www/mhhome-uploads' : '/home/duy/Public';
-export const INPUT_VIDEO_DEST = isProduction
-  ? '/var/www/mhhome-uploads/input-videos'
-  : '/home/duy/Public/input-videos';
+mkdirSync(UPLOAD_TEMP_DIR, { recursive: true });
 
 export function buildFilename(
   _req: Express.Request,
@@ -31,14 +29,32 @@ export function buildFilename(
 
 export const imageUploadOptions = {
   storage: diskStorage({
-    destination: IMAGE_DEST,
+    destination: UPLOAD_TEMP_DIR,
     filename: buildFilename,
   }),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (
+    _req: Express.Request,
+    file: Express.Multer.File,
+    cb: (error: Error | null, acceptFile: boolean) => void,
+  ) => {
+    const allowedMimeTypes = new Set([
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/avif',
+      'image/gif',
+    ]);
+    if (!allowedMimeTypes.has(file.mimetype)) {
+      return cb(new Error('Only JPEG, PNG, WebP, AVIF and GIF images are allowed'), false);
+    }
+    cb(null, true);
+  },
 };
 
 export const videoUploadOptions = {
   storage: diskStorage({
-    destination: INPUT_VIDEO_DEST,
+    destination: UPLOAD_TEMP_DIR,
     filename: buildFilename,
   }),
   limits: { fileSize: 100 * 1024 * 1024 },

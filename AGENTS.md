@@ -218,6 +218,17 @@ Nếu cần gọi trực tiếp CLI: dùng `yarn prisma <args>` (tương đươn
 - File được load tự động theo `NODE_ENV` bởi `main.ts`, `prisma.config.ts`, `prisma/seed.ts`
 - KHÔNG có `.env.example` — dev/prod đã tách sẵn
 
+### Deployment and media migration
+
+- API runs from a GHCR image on `common_shared`; PostgreSQL, Redis and MinIO are
+  owned by common-infra. Runtime: `/srv/commerce/mhhome-api`, host port 50006.
+- Persistent media is in the `mhhome-media` bucket under `images/`, `videos/`,
+  `thumbnails/`; local upload files are temporary only. All environments need MinIO.
+- Follow `ops/migration/README.md` for existing VPS data. Do not reset the DB,
+  rewrite applied migrations. Compare restored data before seeding; CI runs the source-aligned seed on each deployment, preserving MH Home specialAdmins.
+- Preserve project-specific configuration and the temporary KiotViet exclusions
+  in `ops/sync/README.md` when copying from cuahanggiadungmng.
+
 ## Environment Variables (.env)
 
 ```bash

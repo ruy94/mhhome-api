@@ -1,0 +1,44 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mhhome-api-migrate:
+    image: ${API_IMAGE:-mhhome-api:latest}
+    container_name: mhhome_api_migrate
+    env_file:
+      - .env.production
+    command: ["yarn", "prisma:migrate:deploy"]
+    restart: "no"
+    networks:
+      - common_shared
+
+  mhhome-api-seed:
+    image: ${API_IMAGE:-mhhome-api:latest}
+    container_name: mhhome_api_seed
+    env_file:
+      - .env.production
+    command: ["yarn", "db:seed"]
+    restart: "no"
+    networks:
+      - common_shared
+
+  mhhome-api:
+    image: ${API_IMAGE:-mhhome-api:latest}
+    container_name: mhhome_api
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      PORT: 3000
+    ports:
+      - "127.0.0.1:50006:3000"
+    logging: *default-logging
+    networks:
+      - common_shared
+
+networks:
+  common_shared:
+    external: true

@@ -104,7 +104,9 @@ export class ZaloVideoService {
     const uploaded = settledUploads.filter(isFulfilled).map((result) => result.value);
 
     if (settledUploads.some((result) => result.status === 'rejected')) {
-      await Promise.all(uploaded.map((item) => this.uploadService.deleteVideo(item.videoUrl)));
+      await Promise.all(
+        uploaded.map((item) => this.uploadService.enqueueVideoCleanup(item.videoUrl)),
+      );
       throw new BadRequestException('Không thể xử lý một hoặc nhiều video');
     }
 
@@ -113,13 +115,13 @@ export class ZaloVideoService {
         const rows = await Promise.all(
           uploaded.map((item, index) =>
             tx.zaloVideo.create({
-            data: {
-              productId,
-              title: titles[index] ?? '',
-              productLink: productLinks[index] ?? '',
-              videoUrl: item.videoUrl,
-              videoThumbnail: item.thumbnailUrl,
-            },
+              data: {
+                productId,
+                title: titles[index] ?? '',
+                productLink: productLinks[index] ?? '',
+                videoUrl: item.videoUrl,
+                videoThumbnail: item.thumbnailUrl,
+              },
             }),
           ),
         );
@@ -132,25 +134,31 @@ export class ZaloVideoService {
         data: created,
       };
     } catch (error) {
-      await Promise.all(uploaded.map((item) => this.uploadService.deleteVideo(item.videoUrl)));
+      await Promise.all(
+        uploaded.map((item) => this.uploadService.enqueueVideoCleanup(item.videoUrl)),
+      );
       throw error;
     }
   }
 
   /** Update one active Zalo video. */
   async update(id: number, updateZaloVideoDto: UpdateZaloVideoDto) {
-    const existing = await this.findOne(id);
-    return this.prisma.$transaction(async (tx) => {
+    const existingVideo = await this.findOne(id);
+    const updatedVideo = await this.prisma.$transaction(async (tx) => {
       const updated = await tx.zaloVideo.update({
         where: { id },
         data: updateZaloVideoDto,
       });
-      const productIds = [existing.productId, updated.productId].filter(
+      const productIds = [existingVideo.productId, updated.productId].filter(
         (productId): productId is number => Boolean(productId),
       );
       await this.marketplaceCatalog.recordProductChanges(tx, productIds);
       return updated;
     });
+    if (updateZaloVideoDto.videoUrl && updateZaloVideoDto.videoUrl !== existingVideo.videoUrl) {
+      await this.uploadService.enqueueVideoCleanup(existingVideo.videoUrl);
+    }
+    return updatedVideo;
   }
 
   /** Soft-delete one Zalo video and remove its media files. */
@@ -167,13 +175,11 @@ export class ZaloVideoService {
       return row;
     });
 
-    await this.uploadService.deleteVideo(zaloVideo.videoUrl);
+    await this.uploadService.enqueueVideoCleanup(zaloVideo.videoUrl);
     return removed;
   }
 }
 
-function isFulfilled<T>(
-  result: PromiseSettledResult<T>,
-): result is PromiseFulfilledResult<T> {
+function isFulfilled<T>(result: PromiseSettledResult<T>): result is PromiseFulfilledResult<T> {
   return result.status === 'fulfilled';
 }

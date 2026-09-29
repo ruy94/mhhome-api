@@ -16,7 +16,10 @@ export class CategoryService {
 
   async findAll(pageOptionsDto: PageOptionsDto) {
     const result = await this.findAllWithProductCount(pageOptionsDto);
-    return new PageDto(result.items, new PageMetaDto({ itemCount: result.itemCount, pageOptionsDto }));
+    return new PageDto(
+      result.items,
+      new PageMetaDto({ itemCount: result.itemCount, pageOptionsDto }),
+    );
   }
 
   async findAllMiniapp(pageOptionsDto: PageOptionsDto) {
@@ -59,8 +62,8 @@ export class CategoryService {
     const nextImage = dto.image ?? category.image;
     const nextWebsiteImage = dto.websiteImage ?? category.websiteImage;
 
-    return this.prisma.$transaction(async (tx) => {
-      const updatedCategory = await tx.category.update({
+    const updatedCategory = await this.prisma.$transaction(async (tx) => {
+      return await tx.category.update({
         where: { id },
         data: {
           name: dto.name,
@@ -68,14 +71,13 @@ export class CategoryService {
           websiteImage: nextWebsiteImage,
         },
       });
-
-      await this.deleteRemovedImages(
-        [category.image, category.websiteImage],
-        [nextImage, nextWebsiteImage],
-      );
-
-      return updatedCategory;
     });
+
+    await this.deleteRemovedImages(
+      [category.image, category.websiteImage],
+      [nextImage, nextWebsiteImage],
+    );
+    return updatedCategory;
   }
 
   async remove(id: number) {
@@ -145,6 +147,6 @@ export class CategoryService {
       (image) => !nextImageSet.has(image),
     );
 
-    await Promise.all(removedImages.map((image) => this.uploadService.deleteImage(image)));
+    await Promise.all(removedImages.map((image) => this.uploadService.enqueueImageCleanup(image)));
   }
 }

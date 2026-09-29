@@ -43,3 +43,9 @@ coverage/
 
 .env.development
 .env.production
+
+# Operator credentials and migration artifacts
+.migration-complete
+ops/**/*.local
+ops/**/*.secrets
+migration-artifacts/

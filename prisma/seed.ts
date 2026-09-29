@@ -1,6 +1,7 @@
 // Prisma 7 seed script — chạy thủ công bằng: yarn db:seed
 import { config as loadEnv } from 'dotenv';
 import { hashSync } from 'bcryptjs';
+import { Redis } from 'ioredis';
 import { PrismaClient } from '../src/generated/prisma/client.js';
 import { PrismaPg } from '@prisma/adapter-pg';
 
@@ -108,6 +109,9 @@ const PERMISSIONS = [
   { action: 'zbs:send', description: 'Gửi chiến dịch ZBS' },
   // Salework
   { action: 'salework:view', description: 'Xem dữ liệu Salework' },
+  { action: 'kiotviet:view', description: 'Xem dữ liệu KiotViet' },
+  { action: 'kiotviet:sync', description: 'Liên kết SKU, đồng bộ tồn và quản lý webhook KiotViet' },
+  { action: 'kiotviet:write', description: 'Xác nhận giao và đối chiếu hóa đơn KiotViet' },
   { action: 'salework:create', description: 'Tạo đơn Salework' },
   { action: 'salework:warehouse', description: 'Thao tác nhập/xuất/hoàn kho Salework' },
   { action: 'salework:banking', description: 'Thao tác merchant/công nợ/QR Salework Banking' },
@@ -164,6 +168,7 @@ async function main() {
     },
   ];
 
+  const specialAdminIds: string[] = [];
   for (const specialAdmin of specialAdmins) {
     const admin = await prisma.admin.upsert({
       where: { username: specialAdmin.username },
@@ -182,11 +187,47 @@ async function main() {
       update: {},
       create: { adminId: admin.id, roleId: superAdminRole.id },
     });
+    specialAdminIds.push(admin.id);
   }
 
   console.log('✓ Role: Super all permissions initialized');
 
   await prisma.$disconnect();
+
+  // Quyền đã được lưu trong DB; request tiếp theo cần đọc lại thay vì dùng cache cũ.
+  if (specialAdminIds.length) {
+    let redis: Redis | undefined;
+    try {
+      redis = new Redis({
+        host: process.env.REDIS_HOST ?? 'localhost',
+        port: parseInt(process.env.REDIS_PORT ?? '6379', 10),
+        password: process.env.REDIS_PASSWORD || undefined,
+        db: parseInt(process.env.REDIS_DB ?? '0', 10),
+        keyPrefix: process.env.REDIS_KEY_PREFIX || undefined,
+        lazyConnect: true,
+        enableOfflineQueue: false,
+        connectTimeout: 5000,
+        commandTimeout: 5000,
+        maxRetriesPerRequest: 0,
+        retryStrategy: () => null,
+      });
+      // Lỗi kết nối/lệnh được báo một lần trong catch bên dưới.
+      redis.on('error', () => undefined);
+      await redis.connect();
+      const deleted = await redis.del(
+        ...specialAdminIds.map((adminId) => `auth:permissions:${adminId}`),
+      );
+      console.log(
+        `✓ Cleared ${deleted} permission cache keys for ${specialAdminIds.length} special admins`,
+      );
+    } catch {
+      console.warn(
+        '⚠ Permissions updated in DB, but Redis cache could not be cleared. Deploy will continue; special admins may need to wait up to 1 hour for cached permissions to expire.',
+      );
+    } finally {
+      redis?.disconnect();
+    }
+  }
 }
 
 main().catch((err) => {

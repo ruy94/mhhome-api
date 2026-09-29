@@ -20,6 +20,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       port: this.cfg.port,
       password: this.cfg.password,
       db: this.cfg.db,
+      keyPrefix: this.cfg.keyPrefix,
       maxRetriesPerRequest: null,
       enableReadyCheck: true,
       lazyConnect: false,

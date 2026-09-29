@@ -1,72 +1,108 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
 import type { Queue } from 'bullmq';
-import { join } from 'path';
-import { access, copyFile, rename, unlink } from 'fs/promises';
+import { fileTypeFromFile } from 'file-type';
+import { basename, join } from 'path';
+import { mkdir, unlink } from 'fs/promises';
+import { randomUUID } from 'crypto';
+
+import { StorageService } from '../storage/storage.service.js';
+import { PrismaService } from '../../prisma/prisma.service.js';
+import { RedisService } from '../../common/redis/redis.service.js';
 import { compressVideo, generateThumbnail } from './video.utils.js';
+import { UPLOAD_TEMP_DIR } from './upload.config.js';
 
 export const UPLOAD_VIDEO_QUEUE = 'upload-video';
 export const COMPRESS_VIDEO_JOB = 'compress-video';
+export const MEDIA_CLEANUP_QUEUE = 'media-cleanup';
+export const DELETE_IMAGE_JOB = 'delete-image';
+export const DELETE_VIDEO_JOB = 'delete-video';
+
+const IMAGE_PREFIX = 'images';
+const VIDEO_PREFIX = 'videos';
+const THUMBNAIL_PREFIX = 'thumbnails';
 
 export interface CompressVideoJobData {
   filename: string;
-  videoPath: string;
+  videoKey: string;
 }
+
+export interface ProcessedVideo {
+  videoUrl: string;
+  thumbnailUrl: string;
+}
+
+export interface MediaCleanupJobData {
+  filename: string;
+}
+
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/avif',
+  'image/gif',
+]);
+const VIDEO_TOMBSTONE_TTL_SECONDS = 24 * 60 * 60;
 
 @Injectable()
 export class UploadService {
-  private readonly isProduction = process.env.NODE_ENV === 'production';
-  private readonly IMAGE_DIR = this.isProduction ? '/var/www/mhhome-uploads' : '/home/duy/Public';
-  private readonly VIDEO_DIR = this.isProduction
-    ? '/var/www/mhhome-uploads/videos'
-    : '/home/duy/Public/videos';
-  private readonly THUMBNAIL_DIR = this.isProduction
-    ? '/var/www/mhhome-uploads/thumbnails'
-    : '/home/duy/Public/thumbnails';
+  private readonly logger = new Logger(UploadService.name);
 
   constructor(
     @InjectQueue(UPLOAD_VIDEO_QUEUE)
     private readonly uploadVideoQueue: Queue<CompressVideoJobData>,
+    @InjectQueue(MEDIA_CLEANUP_QUEUE)
+    private readonly mediaCleanupQueue: Queue<MediaCleanupJobData>,
+    private readonly storage: StorageService,
+    private readonly prisma: PrismaService,
+    private readonly redis: RedisService,
   ) {}
 
-  async processVideo(file: Express.Multer.File) {
-    const inputPath = file.path;
-    const videoFilename = file.filename;
-    const outputVideoPath = join(this.VIDEO_DIR, videoFilename);
-    const thumbnailFilename = videoFilename.replace(/\.\w+$/, '.jpg');
-    const thumbnailPath = join(this.THUMBNAIL_DIR, thumbnailFilename);
-
+  async processImages(files: Array<Express.Multer.File>) {
+    const uploaded: string[] = [];
     try {
-      await copyFile(inputPath, outputVideoPath);
-      await generateThumbnail(outputVideoPath, thumbnailPath);
-      await unlink(inputPath);
-      await this.enqueueVideoCompression({ filename: videoFilename, videoPath: outputVideoPath });
+      for (const file of files) {
+        const detectedType = await fileTypeFromFile(file.path);
+        if (!detectedType || !ALLOWED_IMAGE_MIME_TYPES.has(detectedType.mime)) {
+          throw new BadRequestException(`Invalid image content: ${file.originalname}`);
+        }
+        const filename = this.safeFilename(file.filename);
+        await this.storage.uploadFile(this.imageKey(filename), file.path, detectedType.mime);
+        uploaded.push(filename);
+      }
 
-      return {
-        message: 'Video uploaded successfully',
-        videoUrl: videoFilename,
-        thumbnailUrl: thumbnailFilename,
-      };
+      return { message: 'Images uploaded successfully', urls: uploaded };
     } catch (err) {
-      Logger.error(err);
-      await Promise.all([
-        this.deleteFileSafe(outputVideoPath),
-        this.deleteFileSafe(thumbnailPath),
-        this.deleteFileSafe(inputPath),
-      ]);
-      throw new InternalServerErrorException('Video processing failed');
+      await Promise.all(uploaded.map((filename) => this.deleteImageNow(filename)));
+      this.logger.error('Image upload failed', err instanceof Error ? err.stack : String(err));
+      if (err instanceof HttpException) throw err;
+      throw new InternalServerErrorException('Image upload failed');
+    } finally {
+      await this.deleteUploadedInputFiles(files);
     }
+  }
+
+  async processVideo(file: Express.Multer.File) {
+    return await this.processUploadedVideo(file, { enqueueCompression: true });
   }
 
   async processMultipleVideos(files: Array<Express.Multer.File>) {
     const settledUploads = await Promise.allSettled(
-      files.map((file) => this.processUploadedVideo(file)),
+      files.map((file) => this.processUploadedVideo(file, { enqueueCompression: true })),
     );
     const uploaded = settledUploads.filter(isFulfilled).map((result) => result.value);
 
     if (settledUploads.some((result) => result.status === 'rejected')) {
       await Promise.all(uploaded.map((item) => this.deleteVideo(item.videoUrl)));
-      Logger.error('Batch video processing failed');
+      this.logger.error('Batch video processing failed');
       throw new InternalServerErrorException('Batch video processing failed');
     }
 
@@ -76,65 +112,81 @@ export class UploadService {
     };
   }
 
-  async processUploadedVideo(file: Express.Multer.File) {
+  async processUploadedVideo(
+    file: Express.Multer.File,
+    options: { enqueueCompression?: boolean } = {},
+  ): Promise<ProcessedVideo> {
     const inputPath = file.path;
-    const outputVideoFilename = file.filename;
-    const originalNameWithoutExt = file.filename.replace(/\.[^/.]+$/, '');
-    const outputThumbnailFilename = `${originalNameWithoutExt}.jpg`;
-    const outputVideoPath = join(this.VIDEO_DIR, outputVideoFilename);
-    const outputThumbnailPath = join(this.THUMBNAIL_DIR, outputThumbnailFilename);
+    const videoFilename = this.safeFilename(file.filename);
+    const thumbnailFilename = videoFilename.replace(/\.\w+$/, '.jpg');
+    const thumbnailPath = join(UPLOAD_TEMP_DIR, `${randomUUID()}-${thumbnailFilename}`);
+    const videoKey = this.videoKey(videoFilename);
+    const thumbnailKey = this.thumbnailKey(thumbnailFilename);
 
     try {
-      await copyFile(inputPath, outputVideoPath);
-      await generateThumbnail(outputVideoPath, outputThumbnailPath);
-      await unlink(inputPath);
+      const detectedType = await fileTypeFromFile(inputPath);
+      if (detectedType?.mime !== 'video/mp4') {
+        throw new BadRequestException(`Invalid MP4 content: ${file.originalname}`);
+      }
+      await generateThumbnail(inputPath, thumbnailPath);
+      await this.storage.uploadFile(videoKey, inputPath, detectedType.mime);
+      await this.storage.uploadFile(thumbnailKey, thumbnailPath, 'image/jpeg');
+
+      if (options.enqueueCompression) {
+        await this.enqueueVideoCompression({ filename: videoFilename, videoKey });
+      }
 
       return {
-        videoUrl: outputVideoFilename,
-        thumbnailUrl: outputThumbnailFilename,
+        videoUrl: videoFilename,
+        thumbnailUrl: thumbnailFilename,
       };
     } catch (err) {
-      Logger.error(`Lỗi xử lý file ${file.originalname}: ${err}`);
-
-      try {
-        await unlink(outputVideoPath);
-      } catch (e) {
-        Logger.debug(e);
-      }
-
-      try {
-        await unlink(outputThumbnailPath);
-      } catch (e) {
-        Logger.debug(e);
-      }
-
-      try {
-        await unlink(inputPath);
-      } catch (e) {
-        Logger.debug(e);
-      }
-
+      this.logger.error(
+        `Video processing failed for ${file.originalname}`,
+        err instanceof Error ? err.stack : String(err),
+      );
+      await Promise.all([
+        this.storage.deleteObject(videoKey).catch(() => undefined),
+        this.storage.deleteObject(thumbnailKey).catch(() => undefined),
+      ]);
+      if (err instanceof HttpException) throw err;
       throw new InternalServerErrorException('Video processing failed');
+    } finally {
+      await Promise.all([this.deleteFileSafe(inputPath), this.deleteFileSafe(thumbnailPath)]);
     }
   }
 
   async compressQueuedVideo(data: CompressVideoJobData) {
-    if (!data.videoPath.startsWith(this.VIDEO_DIR)) {
-      throw new Error('Invalid queued video path');
-    }
+    const filename = this.safeFilename(data.filename);
+    const videoKey = data.videoKey || this.videoKey(filename);
+    const workDir = join(UPLOAD_TEMP_DIR, 'compression');
+    await mkdir(workDir, { recursive: true });
 
-    const tempOutputPath = data.videoPath.replace(
-      /\.\w+$/,
-      `.processing-${process.pid}-${Date.now()}.mp4`,
-    );
+    const inputPath = join(workDir, `${randomUUID()}-${filename}`);
+    const outputPath = inputPath.replace(/\.\w+$/, `.compressed-${process.pid}-${Date.now()}.mp4`);
 
     try {
-      await compressVideo(data.videoPath, tempOutputPath);
-      await rename(tempOutputPath, data.videoPath);
-      Logger.log(`Compressed uploaded video: ${data.filename}`);
+      if (await this.isVideoDeleted(videoKey)) {
+        this.logger.log(`Skipping deleted video compression: ${filename}`);
+        return;
+      }
+      await this.storage.downloadFile(videoKey, inputPath);
+      await compressVideo(inputPath, outputPath);
+      if (await this.isVideoDeleted(videoKey)) return;
+      await this.storage.uploadFile(videoKey, outputPath, 'video/mp4');
+      if (await this.isVideoDeleted(videoKey)) {
+        await this.storage.deleteObject(videoKey);
+        return;
+      }
+      this.logger.log(`Compressed uploaded video: ${filename}`);
     } catch (err) {
-      await this.deleteFileSafe(tempOutputPath);
+      this.logger.error(
+        `Video compression failed for ${filename}`,
+        err instanceof Error ? err.stack : String(err),
+      );
       throw err;
+    } finally {
+      await Promise.all([this.deleteFileSafe(inputPath), this.deleteFileSafe(outputPath)]);
     }
   }
 
@@ -147,18 +199,19 @@ export class UploadService {
         removeOnFail: { count: 200 },
       });
     } catch (err) {
-      Logger.warn(`Video compression queue unavailable, keeping original video: ${data.filename}`);
-      Logger.debug(err);
+      this.logger.warn(
+        `Video compression queue unavailable, keeping original video: ${data.filename}`,
+      );
+      this.logger.debug(err);
     }
   }
 
   private async deleteFileSafe(fullPath: string) {
     try {
-      await access(fullPath);
       await unlink(fullPath);
     } catch (err: any) {
       if (err.code !== 'ENOENT') {
-        Logger.warn(`Delete failed: ${fullPath}`);
+        this.logger.warn(`Delete failed: ${fullPath}`);
       }
     }
   }
@@ -169,31 +222,158 @@ export class UploadService {
 
   async deleteImage(filename?: string) {
     if (!filename) return;
-
-    const fullPath = join(this.IMAGE_DIR, filename);
-    if (!fullPath.startsWith(this.IMAGE_DIR)) return;
-
-    await this.deleteFileSafe(fullPath);
+    const safeFilename = this.safeFilename(filename);
+    await this.assertImageUnreferenced(safeFilename);
+    await this.enqueueImageCleanup(safeFilename);
   }
 
   async deleteVideo(filename?: string) {
     if (!filename) return;
+    const videoFilename = this.safeFilename(filename);
+    await this.assertVideoUnreferenced(videoFilename);
+    await this.enqueueVideoCleanup(videoFilename);
+  }
 
-    const videoPath = join(this.VIDEO_DIR, filename);
-    const thumbnailPath = join(this.THUMBNAIL_DIR, filename.replace(/\.\w+$/, '.jpg'));
+  async enqueueImageCleanup(filename?: string): Promise<void> {
+    if (!filename) return;
+    const safeFilename = this.safeFilename(filename);
+    await this.enqueueCleanup(DELETE_IMAGE_JOB, safeFilename);
+  }
 
-    if (videoPath.startsWith(this.VIDEO_DIR)) {
-      await this.deleteFileSafe(videoPath);
+  async enqueueVideoCleanup(filename?: string): Promise<void> {
+    if (!filename) return;
+    const videoFilename = this.safeFilename(filename);
+    await this.markVideoDeleted(this.videoKey(videoFilename));
+    await this.enqueueCleanup(DELETE_VIDEO_JOB, videoFilename);
+  }
+
+  async deleteImageNow(filename?: string): Promise<void> {
+    if (!filename) return;
+    await this.storage.deleteObject(this.imageKey(this.safeFilename(filename)));
+  }
+
+  async deleteVideoNow(filename?: string): Promise<void> {
+    if (!filename) return;
+    const videoFilename = this.safeFilename(filename);
+    const thumbnailFilename = videoFilename.replace(/\.\w+$/, '.jpg');
+
+    await Promise.all([
+      this.storage.deleteObject(this.videoKey(videoFilename)),
+      this.storage.deleteObject(this.thumbnailKey(thumbnailFilename)),
+    ]);
+  }
+
+  private async enqueueCleanup(jobName: string, filename: string): Promise<void> {
+    try {
+      await this.mediaCleanupQueue.add(
+        jobName,
+        { filename },
+        {
+          jobId: `${jobName}-${filename}`,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          removeOnComplete: { count: 500 },
+          removeOnFail: { count: 500 },
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Unable to enqueue media cleanup for ${filename}`,
+        err instanceof Error ? err.stack : String(err),
+      );
     }
+  }
 
-    if (thumbnailPath.startsWith(this.THUMBNAIL_DIR)) {
-      await this.deleteFileSafe(thumbnailPath);
+  private async markVideoDeleted(videoKey: string): Promise<void> {
+    try {
+      await this.redis
+        .getClient()
+        .set(this.videoTombstoneKey(videoKey), '1', 'EX', VIDEO_TOMBSTONE_TTL_SECONDS);
+    } catch (err) {
+      this.logger.warn(`Unable to mark deleted video: ${videoKey}`);
+      this.logger.debug(err);
     }
+  }
+
+  private async isVideoDeleted(videoKey: string): Promise<boolean> {
+    try {
+      return (await this.redis.getClient().exists(this.videoTombstoneKey(videoKey))) === 1;
+    } catch (err) {
+      this.logger.warn(`Unable to read video tombstone: ${videoKey}`);
+      this.logger.debug(err);
+      return false;
+    }
+  }
+
+  private videoTombstoneKey(videoKey: string): string {
+    return `media:deleted:${videoKey}`;
+  }
+
+  private async assertImageUnreferenced(filename: string): Promise<void> {
+    const [
+      products,
+      variants,
+      categories,
+      websiteCategories,
+      banners,
+      campaignBanners,
+      reviewImages,
+      reviewAvatars,
+    ] = await Promise.all([
+      this.prisma.product.count({ where: { image: { has: filename } } }),
+      this.prisma.variant.count({ where: { image: filename } }),
+      this.prisma.category.count({ where: { image: filename } }),
+      this.prisma.category.count({ where: { websiteImage: filename } }),
+      this.prisma.banner.count({ where: { adBanners: { has: filename } } }),
+      this.prisma.banner.count({ where: { camBanners: { has: filename } } }),
+      this.prisma.review.count({ where: { image: { has: filename } } }),
+      this.prisma.review.count({ where: { customerAvatar: filename } }),
+    ]);
+
+    if (
+      products +
+        variants +
+        categories +
+        websiteCategories +
+        banners +
+        campaignBanners +
+        reviewImages +
+        reviewAvatars >
+      0
+    ) {
+      throw new ConflictException('Image is still referenced');
+    }
+  }
+
+  private async assertVideoUnreferenced(filename: string): Promise<void> {
+    const [products, reviews, zaloVideos] = await Promise.all([
+      this.prisma.product.count({ where: { videoUrl: filename } }),
+      this.prisma.review.count({ where: { videoUrl: filename } }),
+      this.prisma.zaloVideo.count({ where: { videoUrl: filename } }),
+    ]);
+
+    if (products + reviews + zaloVideos > 0) {
+      throw new ConflictException('Video is still referenced');
+    }
+  }
+
+  private imageKey(filename: string): string {
+    return `${IMAGE_PREFIX}/${filename}`;
+  }
+
+  private videoKey(filename: string): string {
+    return `${VIDEO_PREFIX}/${filename}`;
+  }
+
+  private thumbnailKey(filename: string): string {
+    return `${THUMBNAIL_PREFIX}/${filename}`;
+  }
+
+  private safeFilename(filename: string): string {
+    return basename(filename).replace(/^\.+/, '');
   }
 }
 
-function isFulfilled<T>(
-  result: PromiseSettledResult<T>,
-): result is PromiseFulfilledResult<T> {
+function isFulfilled<T>(result: PromiseSettledResult<T>): result is PromiseFulfilledResult<T> {
   return result.status === 'fulfilled';
 }

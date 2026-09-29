@@ -49,6 +49,14 @@ export class EnvironmentVariables {
 
   @IsOptional()
   @IsString()
+  REDIS_KEY_PREFIX?: string;
+
+  @IsOptional()
+  @IsString()
+  REDIS_QUEUE_PREFIX?: string;
+
+  @IsOptional()
+  @IsString()
   GEMINI_API_KEY?: string;
 
   @IsOptional()
@@ -298,6 +306,26 @@ export class EnvironmentVariables {
   @IsString()
   SALEWORK_BANKING_BASE_URL?: string;
 
+  @IsString()
+  MINIO_ENDPOINT!: string;
+
+  @IsOptional()
+  @IsString()
+  MINIO_REGION?: string;
+
+  @IsString()
+  MINIO_ACCESS_KEY!: string;
+
+  @IsString()
+  MINIO_SECRET_KEY!: string;
+
+  @IsString()
+  MINIO_MEDIA_BUCKET!: string;
+
+  @IsOptional()
+  @IsBoolean()
+  MINIO_FORCE_PATH_STYLE?: boolean;
+
   @IsOptional()
   @IsBoolean()
   MARKETPLACE_ENABLED?: boolean;
@@ -363,6 +391,7 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
     'VTP_ENABLED',
     'VTP_PRINT_SHOW_POSTAGE',
     'SALEWORK_ENABLED',
+    'MINIO_FORCE_PATH_STYLE',
     'SALEWORK_STOCK_RECONCILIATION_ENABLED',
     'MARKETPLACE_ENABLED',
     'MARKETPLACE_CHECKOUT_ENABLED',

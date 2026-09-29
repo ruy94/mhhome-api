@@ -39,7 +39,7 @@ export class BannerService {
   private async deleteRemovedImages(oldImages: string[], newImages: string[]) {
     const nextImages = new Set(newImages);
     const removedImages = oldImages.filter((image) => !nextImages.has(image));
-    await Promise.all(removedImages.map((image) => this.uploadService.deleteImage(image)));
+    await Promise.all(removedImages.map((image) => this.uploadService.enqueueImageCleanup(image)));
   }
 
   async create(dto: CreateBannerDto) {
@@ -104,12 +104,11 @@ export class BannerService {
       },
     });
 
-    if (dto.adBanners) {
-      await this.deleteRemovedImages(banner.adBanners, adBanners);
-    }
-
-    if (dto.camBanners) {
-      await this.deleteRemovedImages(banner.camBanners, camBanners);
+    if (dto.adBanners || dto.camBanners) {
+      await this.deleteRemovedImages(
+        [...banner.adBanners, ...banner.camBanners],
+        [...adBanners, ...camBanners],
+      );
     }
 
     return newBanner;
@@ -128,7 +127,7 @@ export class BannerService {
 
     await Promise.all(
       [...banner.adBanners, ...banner.camBanners].map((image) =>
-        this.uploadService.deleteImage(image),
+        this.uploadService.enqueueImageCleanup(image),
       ),
     );
 

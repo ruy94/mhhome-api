@@ -54,7 +54,10 @@ export class ProductService {
       ? (data.tierVariations as unknown as Prisma.InputJsonValue)
       : Prisma.JsonNull;
     const wholesaleEnabled = data.wholesaleEnabled === true;
-    const wholesaleUserIds = this.normalizeWholesaleUserIds(wholesaleEnabled, data.wholesaleUserIds);
+    const wholesaleUserIds = this.normalizeWholesaleUserIds(
+      wholesaleEnabled,
+      data.wholesaleUserIds,
+    );
 
     this.validateWholesaleVariants(data.variants, wholesaleEnabled);
     await this.validateWholesaleUsers(this.prisma, wholesaleUserIds);
@@ -129,7 +132,10 @@ export class ProductService {
     });
   }
 
-  private async listProducts(pageOptionsDto: ProductQueryDto, options: ProductResponseOptions = {}) {
+  private async listProducts(
+    pageOptionsDto: ProductQueryDto,
+    options: ProductResponseOptions = {},
+  ) {
     this.assertValidProductQuery(pageOptionsDto);
 
     const variantWhere = this.buildVariantWhere(pageOptionsDto);
@@ -309,7 +315,10 @@ export class ProductService {
     return { createdAt: order };
   }
 
-  private shouldSortFlashSaleFirst(pageOptionsDto: ProductQueryDto, options: ProductResponseOptions = {}) {
+  private shouldSortFlashSaleFirst(
+    pageOptionsDto: ProductQueryDto,
+    options: ProductResponseOptions = {},
+  ) {
     return pageOptionsDto.flashSaleFirst ?? Boolean(options.publicView);
   }
 
@@ -352,7 +361,8 @@ export class ProductService {
     if (sortBy === ProductSortBy.NAME) return a.name.localeCompare(b.name, 'vi');
     if (sortBy === ProductSortBy.SOLD) return (a.fakeSold ?? 0) - (b.fakeSold ?? 0);
     if (sortBy === ProductSortBy.PRICE) return this.productMinPrice(a) - this.productMinPrice(b);
-    if (sortBy === ProductSortBy.STOCK) return this.productTotalStock(a) - this.productTotalStock(b);
+    if (sortBy === ProductSortBy.STOCK)
+      return this.productTotalStock(a) - this.productTotalStock(b);
     return a.createdAt.getTime() - b.createdAt.getTime();
   }
 
@@ -385,8 +395,8 @@ export class ProductService {
   private isWholesaleViewer(product: ProductListItem, viewerUserId?: number) {
     return Boolean(
       product.wholesaleEnabled &&
-        viewerUserId &&
-        product.wholesaleUsers.some((item) => item.userId === viewerUserId),
+      viewerUserId &&
+      product.wholesaleUsers.some((item) => item.userId === viewerUserId),
     );
   }
 
@@ -483,7 +493,28 @@ export class ProductService {
 
     if (!product) throw new NotFoundException('Product not found');
 
-    return this.prisma.$transaction(async (tx) => {
+    const nextImages = dto.image ?? product.image;
+    const nextVideoUrl = dto.videoUrl === '' ? null : (dto.videoUrl ?? product.videoUrl);
+    const nextVideoThumbnail =
+      dto.videoThumbnail === '' ? null : (dto.videoThumbnail ?? product.videoThumbnail);
+    const removedProductImages = product.image.filter((image) => !new Set(nextImages).has(image));
+    const currentVariantsById = new Map(product.variants.map((variant) => [variant.id, variant]));
+    const replacedVariantImages = (dto.variants ?? [])
+      .filter((variant) => variant.id)
+      .map((variant) => ({
+        oldImage: currentVariantsById.get(variant.id!)?.image,
+        nextImage:
+          variant.image === ''
+            ? null
+            : (variant.image ?? currentVariantsById.get(variant.id!)?.image ?? null),
+      }))
+      .filter(
+        (variant): variant is { oldImage: string; nextImage: string | null } =>
+          Boolean(variant.oldImage) && variant.oldImage !== variant.nextImage,
+      )
+      .map((variant) => variant.oldImage);
+
+    const updatedProduct = await this.prisma.$transaction(async (tx) => {
       const wholesaleEnabled = dto.wholesaleEnabled ?? product.wholesaleEnabled;
       const wholesaleUserIds = this.normalizeWholesaleUserIds(
         wholesaleEnabled,
@@ -500,9 +531,9 @@ export class ProductService {
           categoryId: dto.categoryId,
           name: dto.name,
           detail: dto.detail,
-          image: dto.image ?? product.image,
-          videoUrl: dto.videoUrl ?? product.videoUrl,
-          videoThumbnail: dto.videoThumbnail ?? product.videoThumbnail,
+          image: nextImages,
+          videoUrl: nextVideoUrl,
+          videoThumbnail: nextVideoThumbnail,
           source: dto.source,
           fakeSold: dto.fakeSold,
           wholesaleEnabled,
@@ -520,19 +551,6 @@ export class ProductService {
           data: wholesaleUserIds.map((userId) => ({ productId: id, userId })),
           skipDuplicates: true,
         });
-      }
-
-      // Xóa ảnh/video thừa không còn trong payload
-      if (dto.image !== undefined) {
-        const newImages = new Set(dto.image);
-        for (const oldImg of product.image) {
-          if (!newImages.has(oldImg)) {
-            await this.uploadService.deleteImage(oldImg);
-          }
-        }
-      }
-      if (dto.videoUrl !== undefined && dto.videoUrl !== product.videoUrl && product.videoUrl) {
-        await this.uploadService.deleteVideo(product.videoUrl);
       }
 
       // BƯỚC 2: Xử lý Variants (Upsert với Soft Delete)
@@ -577,7 +595,7 @@ export class ProductService {
                 packageWidthCm: v.packageWidthCm,
                 packageHeightCm: v.packageHeightCm,
                 stock: v.stock,
-                image: v.image,
+                image: v.image === '' ? null : v.image,
                 dimensions: v.dimensions
                   ? (v.dimensions as unknown as Prisma.InputJsonValue)
                   : undefined,
@@ -623,12 +641,23 @@ export class ProductService {
         },
       });
     });
-  }
 
+    await Promise.all(
+      [...new Set([...removedProductImages, ...replacedVariantImages])].map((image) =>
+        this.uploadService.enqueueImageCleanup(image),
+      ),
+    );
+    if (product.videoUrl && product.videoUrl !== nextVideoUrl) {
+      await this.uploadService.enqueueVideoCleanup(product.videoUrl);
+    }
+    return updatedProduct;
+  }
 
   private normalizeWholesaleUserIds(enabled: boolean, userIds?: number[]) {
     if (!enabled) return [];
-    const ids = [...new Set((userIds ?? []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    const ids = [
+      ...new Set((userIds ?? []).map(Number).filter((id) => Number.isInteger(id) && id > 0)),
+    ];
     if (!ids.length) {
       throw new BadRequestException('Vui lòng chọn ít nhất một khách hàng được áp dụng giá sỉ');
     }

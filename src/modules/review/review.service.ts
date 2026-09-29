@@ -68,10 +68,7 @@ export class ReviewService {
     }));
 
     return this.prisma.$transaction(async (tx) => {
-      const created = await tx.review.createMany({
-        data,
-        skipDuplicates: false,
-      });
+      const created = await tx.review.createMany({ data, skipDuplicates: false });
       await this.marketplaceCatalog.recordProductChanges(
         tx,
         data.map((review) => review.productId),
@@ -89,41 +86,39 @@ export class ReviewService {
       throw new NotFoundException(`Review not found`);
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      await tx.review.update({
+    const nextCustomerAvatar =
+      dto.customerAvatar === '' ? null : (dto.customerAvatar ?? existingReview.customerAvatar);
+    const nextImages = dto.image ?? existingReview.image;
+    const nextVideoUrl = dto.videoUrl === '' ? null : (dto.videoUrl ?? existingReview.videoUrl);
+    const nextVideoThumbnail =
+      dto.videoThumbnail === '' ? null : (dto.videoThumbnail ?? existingReview.videoThumbnail);
+
+    const updatedReview = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.review.update({
         where: { id },
         data: {
           ...dto,
-          customerAvatar: dto.customerAvatar ?? existingReview.customerAvatar,
-          image: dto.image ?? existingReview.image,
-          videoUrl: dto.videoUrl ?? existingReview.videoUrl,
+          customerAvatar: nextCustomerAvatar,
+          image: nextImages,
+          videoUrl: nextVideoUrl,
+          videoThumbnail: nextVideoThumbnail,
         },
       });
-      if (dto.customerAvatar && dto.customerAvatar !== existingReview.customerAvatar) {
-        if (existingReview.customerAvatar) {
-          await this.uploadService.deleteImage(existingReview.customerAvatar);
-        }
-      }
-      if (dto.image !== undefined) {
-        const newImages = new Set(dto.image);
-        for (const oldImg of existingReview.image) {
-          if (!newImages.has(oldImg)) {
-            await this.uploadService.deleteImage(oldImg);
-          }
-        }
-      }
-      if (
-        dto.videoUrl !== undefined &&
-        dto.videoUrl !== existingReview.videoUrl &&
-        existingReview.videoUrl
-      ) {
-        await this.uploadService.deleteVideo(existingReview.videoUrl);
-      }
       await this.marketplaceCatalog.recordProductChanges(tx, [existingReview.productId]);
-      return await tx.review.findUnique({
-        where: { id },
-      });
+      return updated;
     });
+
+    const removedImages = existingReview.image.filter((image) => !new Set(nextImages).has(image));
+    if (existingReview.customerAvatar && existingReview.customerAvatar !== nextCustomerAvatar) {
+      removedImages.push(existingReview.customerAvatar);
+    }
+    await Promise.all(
+      [...new Set(removedImages)].map((image) => this.uploadService.enqueueImageCleanup(image)),
+    );
+    if (existingReview.videoUrl && existingReview.videoUrl !== nextVideoUrl) {
+      await this.uploadService.enqueueVideoCleanup(existingReview.videoUrl);
+    }
+    return updatedReview;
   }
 
   async remove(id: number) {
@@ -135,21 +130,20 @@ export class ReviewService {
       throw new NotFoundException(`Review not found`);
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      if (existingReview.customerAvatar) {
-        await this.uploadService.deleteImage(existingReview.customerAvatar);
-      }
-      if (existingReview.image && existingReview.image.length > 0) {
-        for (const imgPath of existingReview.image) await this.uploadService.deleteImage(imgPath);
-      }
-      if (existingReview.videoUrl) {
-        await this.uploadService.deleteVideo(existingReview.videoUrl);
-      }
-      const removed = await tx.review.delete({
+    const deletedReview = await this.prisma.$transaction(async (tx) => {
+      const deleted = await tx.review.delete({
         where: { id },
       });
       await this.marketplaceCatalog.recordProductChanges(tx, [existingReview.productId]);
-      return removed;
+      return deleted;
     });
+
+    await Promise.all(
+      [existingReview.customerAvatar, ...existingReview.image]
+        .filter((image): image is string => Boolean(image))
+        .map((image) => this.uploadService.enqueueImageCleanup(image)),
+    );
+    await this.uploadService.enqueueVideoCleanup(existingReview.videoUrl ?? undefined);
+    return deletedReview;
   }
 }

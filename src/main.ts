@@ -21,6 +21,7 @@ async function bootstrap(): Promise<void> {
     bufferLogs: true,
     rawBody: true, // Cần cho webhook signature verification
   });
+  app.getHttpAdapter().getInstance().disable('x-powered-by');
 
   // Dùng Winston thay NestJS default logger
   app.useLogger(app.get(WINSTON_MODULE_NEST_PROVIDER));
@@ -32,20 +33,12 @@ async function bootstrap(): Promise<void> {
 
   app.useBodyParser('json', { limit: jsonBodyLimitBytes });
 
-  const corsOrigins = (process.env['CORS_ORIGINS'] ?? 'http://localhost:3000,http://localhost:4000')
+  const corsOrigins = (process.env['CORS_ORIGINS'] ?? 'http://localhost:4000')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
   app.enableCors({
-    origin: [
-      ...corsOrigins,
-      'https://mhhome.shop',
-      'https://www.mhhome.shop',
-      'https://admin.mhhome.shop',
-      'https://www.admin.mhhome.shop',
-      'https://sion.gospelserver.click',
-      'https://h5.zdn.vn',
-    ],
+    origin: [...corsOrigins, 'https://h5.zdn.vn'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Last-Event-ID'],

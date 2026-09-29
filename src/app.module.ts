@@ -12,8 +12,9 @@ import redisConfig from './config/redis.config.js';
 import sionHubConfig from './config/sion-hub.config.js';
 import shippingConfig from './config/shipping.config.js';
 import saleworkConfig from './config/salework.config.js';
-import marketplaceConfig from './config/marketplace.config.js';
 import zaloConfig from './config/zalo.config.js';
+import storageConfig from './config/storage.config.js';
+import marketplaceConfig from './config/marketplace.config.js';
 import { validateEnv } from './config/env.validation.js';
 
 import { PrismaModule } from './prisma/prisma.module.js';
@@ -54,6 +55,7 @@ import { SaleworkModule } from './modules/salework/salework.module.js';
 import { WebhookReceiverModule } from './modules/webhook-receiver/webhook-receiver.module.js';
 import { PublicConfigModule } from './modules/public-config/public-config.module.js';
 import { MarketplaceModule } from './modules/marketplace/marketplace.module.js';
+import { StorageModule } from './modules/storage/storage.module.js';
 import { AdminNotificationModule } from './modules/admin-notification/admin-notification.module.js';
 
 const vietnamDateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -100,8 +102,9 @@ function vietnamTimestamp(): string {
         sionHubConfig,
         shippingConfig,
         saleworkConfig,
-        marketplaceConfig,
         zaloConfig,
+        storageConfig,
+        marketplaceConfig,
       ],
       validate: validateEnv,
       envFilePath: [`.env.${process.env.NODE_ENV ?? 'development'}`],
@@ -150,11 +153,13 @@ function vietnamTimestamp(): string {
           password: cfg.get<string>('redis.password') || undefined,
           db: cfg.get<number>('redis.db') ?? 0,
         },
+        prefix: cfg.get<string>('redis.queuePrefix') || undefined,
       }),
     }),
 
     PrismaModule,
     RedisModule,
+    StorageModule,
     ScheduleModule.forRoot(),
     HealthModule,
     AuthModule,

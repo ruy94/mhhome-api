@@ -11,6 +11,10 @@ const requiredEnv = {
   ZALO_APP_SECRET_KEY: 'app-secret',
   CHECKOUT_SECRET_KEY: 'checkout-secret',
   ZALO_OPENAPIS_KEY: 'openapis-key',
+  MINIO_ENDPOINT: 'localhost',
+  MINIO_ACCESS_KEY: 'access-key',
+  MINIO_SECRET_KEY: 'secret-key',
+  MINIO_MEDIA_BUCKET: 'media',
 };
 
 const marketplaceEnv = {
@@ -32,41 +36,31 @@ const booleanKeys = [
   'ELECTRONIC_INVOICE_ENABLED',
   'SPX_ENABLED',
   'SALEWORK_ENABLED',
+  'MINIO_FORCE_PATH_STYLE',
   'MARKETPLACE_ENABLED',
   'MARKETPLACE_CHECKOUT_ENABLED',
 ] as const;
 
 describe('validateEnv boolean flags', () => {
   it.each(booleanKeys)('parses %s=false as boolean false', (key) => {
-    const validated = validateEnv({ ...requiredEnv, [key]: 'false' });
-
-    expect(validated[key]).toBe(false);
+    expect(validateEnv({ ...requiredEnv, [key]: 'false' })[key]).toBe(false);
   });
 
   it.each(booleanKeys)('parses %s=true as boolean true', (key) => {
-    const validated = validateEnv({
-      ...requiredEnv,
-      ...(key === 'MARKETPLACE_ENABLED' || key === 'MARKETPLACE_CHECKOUT_ENABLED'
-        ? { ...marketplaceEnv, MARKETPLACE_ENABLED: 'true' }
-        : {}),
-      [key]: ' TRUE ',
-    });
-
-    expect(validated[key]).toBe(true);
+    expect(
+      validateEnv({
+        ...requiredEnv,
+        ...(key === 'MARKETPLACE_ENABLED' || key === 'MARKETPLACE_CHECKOUT_ENABLED'
+          ? { ...marketplaceEnv, MARKETPLACE_ENABLED: 'true' }
+          : {}),
+        [key]: ' TRUE ',
+      })[key],
+    ).toBe(true);
   });
 
   it('keeps optional boolean flags undefined when omitted', () => {
     const validated = validateEnv(requiredEnv);
-
-    expect(validated.ELECTRONIC_INVOICE_ENABLED).toBeUndefined();
-    expect(validated.SPX_ENABLED).toBeUndefined();
-    expect(validated.SALEWORK_ENABLED).toBeUndefined();
-    expect(validated.MARKETPLACE_ENABLED).toBeUndefined();
-    expect(validated.MARKETPLACE_CHECKOUT_ENABLED).toBeUndefined();
-  });
-
-  it('does not require MinIO for the local filesystem upload implementation', () => {
-    expect(() => validateEnv(requiredEnv)).not.toThrow();
+    for (const key of booleanKeys) expect(validated[key]).toBeUndefined();
   });
 
   it.each(booleanKeys)('rejects an invalid %s value', (key) => {
