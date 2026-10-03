@@ -19,6 +19,7 @@ jest.mock('../salework-sync/salework-stock-sync.service.js', () => ({
 jest.mock('../admin-notification/admin-notification.service.js', () => ({
   AdminNotificationService: class {},
 }));
+jest.mock('../kiotviet/kiotviet.service.js', () => ({ KiotVietService: class KiotVietService {} }));
 
 import { MarketplaceReservationService } from './marketplace-reservation.service.js';
 import { MarketplaceQuoteMode, MarketplaceShipmentStatus } from './dto/marketplace-commerce.dto.js';
@@ -32,7 +33,7 @@ describe('MarketplaceReservationService', () => {
       update: jest.fn(),
     },
     address: { create: jest.fn() },
-    variant: { updateMany: jest.fn(), update: jest.fn() },
+    variant: { findMany: jest.fn(), updateMany: jest.fn(), update: jest.fn() },
     flashSaleItem: { findUnique: jest.fn(), updateMany: jest.fn() },
     voucher: { findUnique: jest.fn(), updateMany: jest.fn() },
     userVoucher: {
@@ -63,7 +64,10 @@ describe('MarketplaceReservationService', () => {
       }),
     },
   };
-  const commerce = { finalizeWithTransaction: jest.fn() };
+  const commerce = {
+    ensureStockFresh: jest.fn().mockResolvedValue(undefined),
+    finalizeWithTransaction: jest.fn(),
+  };
   const catalog = { recordProductChanges: jest.fn() };
   const saleWorkStockSync = {
     exportOrderStock: jest.fn(),
@@ -82,7 +86,18 @@ describe('MarketplaceReservationService', () => {
     { reservationTtlSeconds: 300 } as never,
   );
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tx.variant.findMany.mockResolvedValue([
+      {
+        id: 11,
+        productId: 1,
+        inventoryProvider: 'LOCAL',
+        kiotvietProductCode: null,
+        kiotvietBranchId: null,
+      },
+    ]);
+  });
 
   it('rejects an atomic stock hold when the available stock was taken concurrently', async () => {
     tx.marketplaceCheckoutReservation.findUnique.mockResolvedValue(null);

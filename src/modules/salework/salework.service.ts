@@ -24,12 +24,11 @@ import type { SaleworkInventoryTransactionDto } from './dto/salework-inventory-t
 import type { SaleworkProductReportDto } from './dto/salework-report.dto.js';
 import type { SaleworkWarehouseTransactionDto } from './dto/salework-warehouse.dto.js';
 import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
-import { MarketplaceReservationStatus } from '../../generated/prisma/enums.js';
+import { InventoryProvider, MarketplaceReservationStatus } from '../../generated/prisma/enums.js';
 import { RedisService } from '../../common/redis/redis.service.js';
 import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
 
 const STOCK_RECONCILIATION_JOB = 'salework-stock-reconciliation';
-
 @Injectable()
 export class SaleworkService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SaleworkService.name);
@@ -87,6 +86,7 @@ export class SaleworkService implements OnModuleInit, OnModuleDestroy {
         isDeleted: 0,
         saleworkProductCode: { not: null },
         saleworkWarehouseId: { not: null },
+        inventoryProvider: InventoryProvider.SALEWORK,
       },
       select: {
         id: true,

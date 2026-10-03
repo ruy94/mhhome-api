@@ -293,8 +293,13 @@ model Variant {
   packageWidthCm       Decimal? @map("package_width_cm") @db.Decimal(8, 2)
   packageHeightCm      Decimal? @map("package_height_cm") @db.Decimal(8, 2)
   stock                Int
+  inventoryProvider    InventoryProvider @default(LOCAL) @map("inventory_provider")
   saleworkProductCode  String?  @map("salework_product_code") @db.VarChar(255)
   saleworkWarehouseId  String?  @map("salework_warehouse_id") @db.VarChar(255)
+  kiotvietProductCode  String?  @map("kiotviet_product_code") @db.VarChar(255)
+  kiotvietBranchId     Int?     @map("kiotviet_branch_id")
+  kiotvietLinkedAt     DateTime? @map("kiotviet_linked_at")
+  kiotvietStockSyncedAt DateTime? @map("kiotviet_stock_synced_at")
   isDeleted            Int      @default(0) @map("is_deleted")
 
   dimensions Json? @db.JsonB
@@ -309,9 +314,31 @@ model Variant {
   cartItems                        CartItem[]
   saleWorkOutboxLogs               SaleWorkOutboxLog[]
   marketplaceInventoryReservations MarketplaceInventoryReservation[]
+  kiotvietInventory                KiotVietInventory?                 @relation(fields: [kiotvietProductCode], references: [productCode], onUpdate: Cascade, onDelete: Restrict)
 
   @@unique([saleworkProductCode, saleworkWarehouseId])
+  @@index([kiotvietProductCode, kiotvietBranchId])
   @@map("variants")
+}
+
+model KiotVietInventory {
+  productCode          String   @id @map("product_code") @db.VarChar(255)
+  branchId             Int      @map("branch_id")
+  remoteAvailableStock Int      @map("remote_available_stock")
+  availableStock       Int      @map("available_stock")
+  stockSyncedAt        DateTime @map("stock_synced_at")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  variants Variant[]
+
+  @@map("kiotviet_inventories")
+}
+
+enum InventoryProvider {
+  LOCAL
+  SALEWORK
+  KIOTVIET
 }
 
 model ProductWholesaleUser {
@@ -465,9 +492,12 @@ model Order {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+  kiotvietPaidAt DateTime? @map("kiotviet_paid_at")
+
   // Relationship to Product through OrderProduct
   orderProducts      OrderProduct[]
   saleWorkOutboxLogs SaleWorkOutboxLog[]
+  kiotVietOutboxLogs KiotVietOutboxLog[]
 
   productVoucher  Voucher? @relation("ProductVoucher", fields: [productVoucherId], references: [id])
   shippingVoucher Voucher? @relation("ShippingVoucher", fields: [deliveryVoucherId], references: [id])
@@ -621,6 +651,48 @@ enum SaleWorkOutboxStatus {
   Pending
   Success
   Failed
+}
+
+enum KiotVietOutboxStatus {
+  WAITING_SELLER
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  UNCERTAIN
+}
+
+enum KiotVietOutboxOperation {
+  CREATE_INVOICE
+}
+
+model KiotVietOutboxLog {
+  id              Int                     @id @default(autoincrement())
+  orderId         Int                     @map("order_id")
+  operation       KiotVietOutboxOperation
+  businessKey     String                  @unique @map("business_key") @db.VarChar(150)
+  payloadHash     String                  @map("payload_hash") @db.VarChar(64)
+  status          KiotVietOutboxStatus    @default(WAITING_SELLER)
+  requestPayload  Json                    @map("request_payload") @db.JsonB
+  soldById        String?                 @map("sold_by_id") @db.VarChar(30)
+  selectedByAdminId String?               @map("selected_by_admin_id") @db.VarChar(50)
+  selectedAt      DateTime?               @map("selected_at")
+  stockRefreshedAt DateTime?               @map("stock_refreshed_at")
+  responsePayload Json?                   @map("response_payload") @db.JsonB
+  externalId      String?                 @unique(map: "kiotviet_outbox_logs_external_id_key") @map("external_id") @db.VarChar(100)
+  externalCode    String?                 @map("external_code") @db.VarChar(100)
+  errorMessage    String?                 @map("error_message") @db.VarChar(1000)
+  attemptCount    Int                     @default(0) @map("attempt_count")
+  lockedAt        DateTime?               @map("locked_at")
+  completedAt     DateTime?               @map("completed_at")
+  createdAt       DateTime                @default(now()) @map("created_at")
+  updatedAt       DateTime                @updatedAt @map("updated_at")
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([orderId, operation])
+  @@map("kiotviet_outbox_logs")
 }
 
 model SaleWorkOutboxLog {

@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, forwardRef, Inject, Injectable } from '@nestjs/common';
 
 import {
   ConditionType,
@@ -9,6 +9,7 @@ import {
   VoucherType,
 } from '../../generated/prisma/enums.js';
 import type { Prisma } from '../../generated/prisma/client.js';
+import { KiotVietClientService } from '../integrations/kiotviet/kiotviet-client.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import {
   MarketplaceQuoteMode,
@@ -17,6 +18,7 @@ import {
   type MarketplaceSourceQuotePreviewDto,
 } from './dto/marketplace-commerce.dto.js';
 import { MarketplaceCatalogService } from './marketplace-catalog.service.js';
+import { KiotVietService } from '../kiotviet/kiotviet.service.js';
 
 type VoucherRecord = Prisma.VoucherGetPayload<{
   include: { voucherProducts: { select: { productId: true } } };
@@ -27,115 +29,123 @@ export class MarketplaceCommerceService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly catalog: MarketplaceCatalogService,
+    private readonly kiotVietClient: KiotVietClientService,
+    @Inject(forwardRef(() => KiotVietService))
+    private readonly kiotViet: KiotVietService,
   ) {}
 
-  preview(dto: MarketplaceSourceQuotePreviewDto) {
+  async preview(dto: MarketplaceSourceQuotePreviewDto) {
+    await this.ensureStockFresh(dto);
     return this.prisma.$transaction((tx) => this.buildPreview(tx, dto));
   }
 
-  finalize(dto: MarketplaceSourceQuoteFinalizeDto) {
+  async finalize(dto: MarketplaceSourceQuoteFinalizeDto) {
+    await this.ensureStockFresh(dto);
     return this.prisma.$transaction((tx) => this.finalizeWithTransaction(tx, dto));
+  }
+
+  ensureStockFresh(dto: MarketplaceSourceQuotePreviewDto): Promise<void> {
+    return this.kiotViet.ensureCheckoutStockFresh(
+      dto.items.map((item) => this.positiveInt(item.sourceVariantId, 'variant')),
+    );
   }
 
   async finalizeWithTransaction(
     tx: Prisma.TransactionClient,
     dto: MarketplaceSourceQuoteFinalizeDto,
   ) {
-      const preview = await this.buildPreview(tx, dto);
-      const manuallySelectedIds = [
-        dto.voucherSelection.orderVoucherId,
-        dto.voucherSelection.shippingVoucherId,
-        ...(dto.voucherSelection.itemVouchers ?? []).map((item) => item.voucherId),
-      ]
-        .filter((value): value is string => Boolean(value))
-        .map((value) => this.positiveInt(value, 'voucher'));
-      const publicVouchers = await tx.voucher.findMany({
-        where: {
-          conditionType: ConditionType.ZaloMiniApp,
-          OR: [
-            { type: { in: [VoucherType.Normal, VoucherType.Freeship] } },
-            ...(dto.context.mode === MarketplaceQuoteMode.LocalHost && manuallySelectedIds.length
-              ? [{ id: { in: manuallySelectedIds } }]
-              : []),
-          ],
-          isActive: true,
-          isDeleted: 0,
-          validFrom: { lte: new Date() },
-          validUntil: { gte: new Date() },
-        },
-        include: { voucherProducts: { select: { productId: true } } },
-      });
-      const merchandiseSubtotal = preview.merchandiseSubtotal;
-      const itemCandidates = this.itemCandidates(publicVouchers, preview.items);
-      const selectedItems =
-        dto.voucherSelection.mode === MarketplaceVoucherSelectionMode.Auto
-          ? this.pickBestItemVouchers(itemCandidates)
-          : this.validateManualItemVouchers(dto.voucherSelection.itemVouchers ?? [], itemCandidates);
-      const itemVoucherDiscount = selectedItems.reduce((sum, item) => sum + item.discount, 0);
-      const orderBase = Math.max(
-        preview.items
-          .filter((item) => item.pricingMode !== PricingMode.Wholesale)
-          .reduce((sum, item) => sum + item.lineAmount, 0) - itemVoucherDiscount,
-        0,
-      );
-      const orderCandidates = this.scopeCandidates(
-        publicVouchers,
-        VoucherScope.Order,
-        orderBase,
-        merchandiseSubtotal,
-      );
-      const shippingCandidates = this.scopeCandidates(
-        publicVouchers,
-        VoucherScope.Shipping,
-        dto.shippingFee,
-        merchandiseSubtotal,
-      );
-      const selectedOrder = this.selectScopeVoucher(
-        dto.voucherSelection.mode,
-        dto.voucherSelection.orderVoucherId,
-        orderCandidates,
-      );
-      const selectedShipping = this.selectScopeVoucher(
-        dto.voucherSelection.mode,
-        dto.voucherSelection.shippingVoucherId,
-        shippingCandidates,
-      );
-      const orderVoucherDiscount = selectedOrder?.discount ?? 0;
-      const shippingVoucherDiscount = selectedShipping?.discount ?? 0;
-      const shippingAmount = Math.max(dto.shippingFee - shippingVoucherDiscount, 0);
+    const preview = await this.buildPreview(tx, dto);
+    const manuallySelectedIds = [
+      dto.voucherSelection.orderVoucherId,
+      dto.voucherSelection.shippingVoucherId,
+      ...(dto.voucherSelection.itemVouchers ?? []).map((item) => item.voucherId),
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => this.positiveInt(value, 'voucher'));
+    const publicVouchers = await tx.voucher.findMany({
+      where: {
+        conditionType: ConditionType.ZaloMiniApp,
+        OR: [
+          { type: { in: [VoucherType.Normal, VoucherType.Freeship] } },
+          ...(dto.context.mode === MarketplaceQuoteMode.LocalHost && manuallySelectedIds.length
+            ? [{ id: { in: manuallySelectedIds } }]
+            : []),
+        ],
+        isActive: true,
+        isDeleted: 0,
+        validFrom: { lte: new Date() },
+        validUntil: { gte: new Date() },
+      },
+      include: { voucherProducts: { select: { productId: true } } },
+    });
+    const merchandiseSubtotal = preview.merchandiseSubtotal;
+    const itemCandidates = this.itemCandidates(publicVouchers, preview.items);
+    const selectedItems =
+      dto.voucherSelection.mode === MarketplaceVoucherSelectionMode.Auto
+        ? this.pickBestItemVouchers(itemCandidates)
+        : this.validateManualItemVouchers(dto.voucherSelection.itemVouchers ?? [], itemCandidates);
+    const itemVoucherDiscount = selectedItems.reduce((sum, item) => sum + item.discount, 0);
+    const orderBase = Math.max(
+      preview.items
+        .filter((item) => item.pricingMode !== PricingMode.Wholesale)
+        .reduce((sum, item) => sum + item.lineAmount, 0) - itemVoucherDiscount,
+      0,
+    );
+    const orderCandidates = this.scopeCandidates(
+      publicVouchers,
+      VoucherScope.Order,
+      orderBase,
+      merchandiseSubtotal,
+    );
+    const shippingCandidates = this.scopeCandidates(
+      publicVouchers,
+      VoucherScope.Shipping,
+      dto.shippingFee,
+      merchandiseSubtotal,
+    );
+    const selectedOrder = this.selectScopeVoucher(
+      dto.voucherSelection.mode,
+      dto.voucherSelection.orderVoucherId,
+      orderCandidates,
+    );
+    const selectedShipping = this.selectScopeVoucher(
+      dto.voucherSelection.mode,
+      dto.voucherSelection.shippingVoucherId,
+      shippingCandidates,
+    );
+    const orderVoucherDiscount = selectedOrder?.discount ?? 0;
+    const shippingVoucherDiscount = selectedShipping?.discount ?? 0;
+    const shippingAmount = Math.max(dto.shippingFee - shippingVoucherDiscount, 0);
 
-      return {
-        ...preview,
-        itemVoucherDiscount,
-        orderVoucherDiscount,
-        shippingFee: dto.shippingFee,
-        shippingVoucherDiscount,
-        shippingAmount,
-        totalAmount: Math.max(
-          merchandiseSubtotal - itemVoucherDiscount - orderVoucherDiscount + shippingAmount,
-          0,
-        ),
-        voucherSelection: {
-          mode: dto.voucherSelection.mode,
-          orderVoucherId: selectedOrder?.id ?? null,
-          shippingVoucherId: selectedShipping?.id ?? null,
-          itemVouchers: selectedItems.map((item) => ({
-            sourceProductId: item.sourceProductId,
-            voucherId: item.id,
-          })),
-        },
-        voucherCandidates: {
-          order: orderCandidates,
-          shipping: shippingCandidates,
-          items: itemCandidates,
-        },
-      };
+    return {
+      ...preview,
+      itemVoucherDiscount,
+      orderVoucherDiscount,
+      shippingFee: dto.shippingFee,
+      shippingVoucherDiscount,
+      shippingAmount,
+      totalAmount: Math.max(
+        merchandiseSubtotal - itemVoucherDiscount - orderVoucherDiscount + shippingAmount,
+        0,
+      ),
+      voucherSelection: {
+        mode: dto.voucherSelection.mode,
+        orderVoucherId: selectedOrder?.id ?? null,
+        shippingVoucherId: selectedShipping?.id ?? null,
+        itemVouchers: selectedItems.map((item) => ({
+          sourceProductId: item.sourceProductId,
+          voucherId: item.id,
+        })),
+      },
+      voucherCandidates: {
+        order: orderCandidates,
+        shipping: shippingCandidates,
+        items: itemCandidates,
+      },
+    };
   }
 
-  private async buildPreview(
-    tx: Prisma.TransactionClient,
-    dto: MarketplaceSourceQuotePreviewDto,
-  ) {
+  private async buildPreview(tx: Prisma.TransactionClient, dto: MarketplaceSourceQuotePreviewDto) {
     if (dto.context.mode === MarketplaceQuoteMode.LocalHost && !dto.context.hostLocalUserId) {
       throw new BadRequestException('Thiếu user local của host shop');
     }
@@ -172,6 +182,7 @@ export class MarketplaceCommerceService {
     if (variants.length !== new Set(variantIds).size) {
       throw new BadRequestException('Một số biến thể không còn khả dụng');
     }
+    await this.kiotVietClient.assertStockFresh(variants);
 
     const items = dto.items.map((input, index) => {
       const variantId = variantIds[index];
@@ -226,7 +237,7 @@ export class MarketplaceCommerceService {
         quantity: input.quantity,
         productName: variant.product.name,
         variantName: variant.name,
-        sku: variant.saleworkProductCode,
+        sku: variant.kiotvietProductCode ?? variant.saleworkProductCode,
         image: this.catalog.resolveMedia(
           variant.image ?? variant.product.image[0] ?? null,
           'image',
@@ -247,17 +258,16 @@ export class MarketplaceCommerceService {
       };
     });
     const maxDimension = (field: 'packageLengthCm' | 'packageWidthCm' | 'packageHeightCm') => {
-      const values = items.map((item) => item[field]).filter((value): value is number => Boolean(value));
+      const values = items
+        .map((item) => item[field])
+        .filter((value): value is number => Boolean(value));
       return values.length ? Math.max(...values) : null;
     };
     return {
       items,
       merchandiseSubtotal: items.reduce((sum, item) => sum + item.lineAmount, 0),
       parcel: {
-        weightGrams: items.reduce(
-          (sum, item) => sum + item.packageWeightGrams * item.quantity,
-          0,
-        ),
+        weightGrams: items.reduce((sum, item) => sum + item.packageWeightGrams * item.quantity, 0),
         lengthCm: maxDimension('packageLengthCm'),
         widthCm: maxDimension('packageWidthCm'),
         heightCm: maxDimension('packageHeightCm'),
@@ -275,7 +285,10 @@ export class MarketplaceCommerceService {
     }>,
   ) {
     return vouchers
-      .filter((voucher) => voucher.scope === VoucherScope.Product && voucher.type !== VoucherType.Freeship)
+      .filter(
+        (voucher) =>
+          voucher.scope === VoucherScope.Product && voucher.type !== VoucherType.Freeship,
+      )
       .flatMap((voucher) =>
         voucher.voucherProducts.map(({ productId }) => {
           const amount = items
@@ -312,8 +325,7 @@ export class MarketplaceCommerceService {
     const maxDiscount =
       Number.isFinite(maxDiscountValue) && maxDiscountValue > 0 ? maxDiscountValue : null;
     const reason =
-      voucher.usageLimit !== null &&
-      voucher.usedCount + voucher.reservedCount >= voucher.usageLimit
+      voucher.usageLimit !== null && voucher.usedCount + voucher.reservedCount >= voucher.usageLimit
         ? 'Voucher đã hết lượt sử dụng'
         : conditionBase < Number(voucher.minOrderValue)
           ? 'Chưa đạt giá trị tối thiểu'
@@ -321,8 +333,7 @@ export class MarketplaceCommerceService {
             ? 'Không có giá trị đủ điều kiện'
             : null;
     const discount = reason ? 0 : this.discount(voucher, discountBase);
-    const disabledReason =
-      reason ?? (discount <= 0 ? 'Voucher không tạo được ưu đãi' : null);
+    const disabledReason = reason ?? (discount <= 0 ? 'Voucher không tạo được ưu đãi' : null);
     return {
       id: String(voucher.id),
       code: voucher.code,
@@ -340,14 +351,18 @@ export class MarketplaceCommerceService {
     };
   }
 
-  private pickBestItemVouchers(candidates: ReturnType<MarketplaceCommerceService['itemCandidates']>) {
+  private pickBestItemVouchers(
+    candidates: ReturnType<MarketplaceCommerceService['itemCandidates']>,
+  ) {
     const selected: typeof candidates = [];
     const used = new Set<string>();
     for (const productId of new Set(candidates.map((candidate) => candidate.sourceProductId))) {
       const best = candidates
         .filter(
           (candidate) =>
-            candidate.sourceProductId === productId && candidate.eligible && !used.has(candidate.id),
+            candidate.sourceProductId === productId &&
+            candidate.eligible &&
+            !used.has(candidate.id),
         )
         .sort((left, right) => right.discount - left.discount)[0];
       if (best?.discount) {
@@ -396,9 +411,7 @@ export class MarketplaceCommerceService {
     if (voucher.discountType === DiscountType.Percentage) {
       const value = Math.floor((amount * Number(voucher.discountValue)) / 100);
       const maxDiscount = Number(voucher.maxDiscount ?? 0);
-      return Number.isFinite(maxDiscount) && maxDiscount > 0
-        ? Math.min(value, maxDiscount)
-        : value;
+      return Number.isFinite(maxDiscount) && maxDiscount > 0 ? Math.min(value, maxDiscount) : value;
     }
     return Math.min(Number(voucher.discountValue), amount);
   }

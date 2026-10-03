@@ -81,6 +81,7 @@ describe('ShippingService marketplace soft cancellation', () => {
       {} as never,
       {} as never,
       marketplaceClient as never,
+      { reconcileAfterOrderPaid: jest.fn().mockResolvedValue(undefined) } as never,
     );
     return { marketplaceClient, prisma, service };
   }

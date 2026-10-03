@@ -28,6 +28,11 @@ import type {
 import { MarketplaceCatalogService } from './marketplace-catalog.service.js';
 import { MarketplaceCommerceService } from './marketplace-commerce.service.js';
 import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
+import {
+  KiotVietSharedStockError,
+  reserveKiotVietSharedStock,
+  restoreKiotVietSharedStock,
+} from '../kiotviet/kiotviet-shared-inventory.js';
 
 @Injectable()
 export class MarketplaceReservationService {
@@ -48,6 +53,8 @@ export class MarketplaceReservationService {
       throw new BadRequestException('Thời hạn reservation không hợp lệ');
     }
 
+    await this.commerce.ensureStockFresh(dto);
+
     await this.prisma.$transaction(
       async (tx) => {
         const existing = await tx.marketplaceCheckoutReservation.findUnique({
@@ -56,16 +63,35 @@ export class MarketplaceReservationService {
         if (existing) return;
 
         const quote = await this.commerce.finalizeWithTransaction(tx, dto);
-        const productIds = new Set<number>();
+        let sharedInventory: Awaited<ReturnType<typeof reserveKiotVietSharedStock>>;
+        try {
+          sharedInventory = await reserveKiotVietSharedStock(
+            tx,
+            quote.items.map((item) => ({
+              productId: this.positiveInt(item.sourceProductId, 'product'),
+              variantId: this.positiveInt(item.sourceVariantId, 'variant'),
+              quantity: item.quantity,
+              variantName: item.variantName,
+            })),
+          );
+        } catch (error) {
+          if (error instanceof KiotVietSharedStockError) {
+            throw new ConflictException(error.message);
+          }
+          throw error;
+        }
+        const productIds = new Set<number>(sharedInventory.affectedProductIds);
         for (const item of quote.items) {
           const productId = this.positiveInt(item.sourceProductId, 'product');
           const variantId = this.positiveInt(item.sourceVariantId, 'variant');
-          const updated = await tx.variant.updateMany({
-            where: { id: variantId, productId, isDeleted: 0, stock: { gte: item.quantity } },
-            data: { stock: { decrement: item.quantity } },
-          });
-          if (!updated.count)
-            throw new ConflictException(`Sản phẩm ${item.variantName} không đủ tồn kho`);
+          if (!sharedInventory.variantIds.has(variantId)) {
+            const updated = await tx.variant.updateMany({
+              where: { id: variantId, productId, isDeleted: 0, stock: { gte: item.quantity } },
+              data: { stock: { decrement: item.quantity } },
+            });
+            if (!updated.count)
+              throw new ConflictException(`Sản phẩm ${item.variantName} không đủ tồn kho`);
+          }
           productIds.add(productId);
 
           if (item.flashSaleItemId) {
@@ -514,6 +540,9 @@ export class MarketplaceReservationService {
             where: { id: order.id },
             data: {
               status: nextOrderStatus,
+              ...(order.status !== OrderStatus.Paid && nextOrderStatus === OrderStatus.Paid
+                ? { kiotvietPaidAt: new Date() }
+                : {}),
               ...(dto.trackingNo ? { trackingCode: dto.trackingNo } : {}),
             },
           });
@@ -600,12 +629,23 @@ export class MarketplaceReservationService {
     reservation: Awaited<ReturnType<MarketplaceReservationService['findForUpdate']>>,
     status: MarketplaceReservationStatus,
   ) {
-    const productIds = new Set<number>();
+    const sharedInventory = await restoreKiotVietSharedStock(
+      tx,
+      reservation.inventoryItems.map((item) => ({
+        productId: item.productId,
+        variantId: item.variantId,
+        quantity: item.quantity,
+        variantName: `#${item.variantId}`,
+      })),
+    );
+    const productIds = new Set<number>(sharedInventory.affectedProductIds);
     for (const item of reservation.inventoryItems) {
-      await tx.variant.update({
-        where: { id: item.variantId },
-        data: { stock: { increment: item.quantity } },
-      });
+      if (!sharedInventory.variantIds.has(item.variantId)) {
+        await tx.variant.update({
+          where: { id: item.variantId },
+          data: { stock: { increment: item.quantity } },
+        });
+      }
       if (item.flashSaleItemId) {
         await tx.flashSaleItem.updateMany({
           where: { id: item.flashSaleItemId, sold: { gte: item.quantity } },
@@ -636,12 +676,23 @@ export class MarketplaceReservationService {
     if (!reservation.order) {
       throw new ConflictException('Reservation đã confirm nhưng chưa có đơn hàng nguồn');
     }
-    const productIds = new Set<number>();
+    const sharedInventory = await restoreKiotVietSharedStock(
+      tx,
+      reservation.inventoryItems.map((item) => ({
+        productId: item.productId,
+        variantId: item.variantId,
+        quantity: item.quantity,
+        variantName: `#${item.variantId}`,
+      })),
+    );
+    const productIds = new Set<number>(sharedInventory.affectedProductIds);
     for (const item of reservation.inventoryItems) {
-      await tx.variant.update({
-        where: { id: item.variantId },
-        data: { stock: { increment: item.quantity } },
-      });
+      if (!sharedInventory.variantIds.has(item.variantId)) {
+        await tx.variant.update({
+          where: { id: item.variantId },
+          data: { stock: { increment: item.quantity } },
+        });
+      }
       if (item.flashSaleItemId) {
         await tx.flashSaleItem.updateMany({
           where: { id: item.flashSaleItemId, sold: { gte: item.quantity } },
@@ -715,7 +766,11 @@ export class MarketplaceReservationService {
   private findForUpdate(tx: Prisma.TransactionClient, id: string) {
     return tx.marketplaceCheckoutReservation.findUniqueOrThrow({
       where: { id },
-      include: { inventoryItems: true, vouchers: true, order: true },
+      include: {
+        inventoryItems: { include: { variant: { select: { inventoryProvider: true } } } },
+        vouchers: true,
+        order: true,
+      },
     });
   }
 

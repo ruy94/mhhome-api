@@ -51,9 +51,10 @@ import {
 } from './spx-status-mapper.js';
 import { MarketplaceClientService } from '../marketplace/marketplace-client.service.js';
 import { mapVtpStatus } from './vtp-status-mapper.js';
-
 import { RedisService } from '../../common/redis/redis.service.js';
 import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
+import { KiotVietService } from '../kiotviet/kiotviet.service.js';
+
 const SPX_VN_MAX_PARCEL_WEIGHT_GRAMS = 15_000;
 const SPX_VN_MAX_PARCEL_WEIGHT_MESSAGE =
   'Giỏ hàng vượt quá trọng lượng vận chuyển (tối đa 15kg), hãy chia bớt sản phẩm cho đơn sau';
@@ -65,14 +66,30 @@ export class ShippingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly spxClient: SpxShippingClientService,
     private readonly redis: RedisService,
     private readonly adminNotifications: AdminNotificationService,
-    private readonly spxClient: SpxShippingClientService,
     private readonly vtpClient: VtpShippingClientService,
     private readonly saleWorkStockSync: SaleWorkStockSyncService,
     private readonly orderInventory: OrderInventoryService,
     private readonly marketplaceClient: MarketplaceClientService,
+    private readonly kiotviet: KiotVietService,
   ) {}
+
+  private async reconcileKiotVietIfPaid(
+    orderId: number,
+    previousStatus: OrderStatus | undefined,
+    nextStatus: OrderStatus | undefined,
+  ): Promise<void> {
+    if (previousStatus === OrderStatus.Paid || nextStatus !== OrderStatus.Paid) return;
+    try {
+      await this.kiotviet.reconcileAfterOrderPaid(orderId);
+    } catch (error) {
+      this.logger.warn(
+        `KiotViet reconciliation request after shipping delivery for order #${orderId} failed; polling will retry: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
   isSpxEnabled() {
     return this.configService.get<boolean>('shipping.spx.enabled') === true;
@@ -100,6 +117,7 @@ export class ShippingService {
         );
       }
     } catch (error) {
+
       const message = error instanceof Error ? error.message : 'Unable to refresh SPX tracking';
       this.logger.warn(`SPX tracking cron failed: ${message}`);
     }
@@ -875,15 +893,18 @@ export class ShippingService {
   async cancelMarketplaceShippingOrder(orderId: number) {
     const [subOrderId] = await this.marketplaceSubOrderIds([orderId]);
     return (
-      await this.marketplaceClient.cancelSourceShipment(subOrderId, `source-cancel:${subOrderId}`)
+      await this.marketplaceClient.cancelSourceShipment(
+        subOrderId,
+        `source-cancel:${subOrderId}`,
+      )
     ).data;
   }
 
   async getAwbForOrders(input: { orderIds?: number[]; trackingNos?: string[] }) {
     const orderIds = [...new Set(input.orderIds ?? [])];
-    const requestedTrackingNos = [
-      ...new Set((input.trackingNos ?? []).map((value) => value.trim()).filter(Boolean)),
-    ];
+    const requestedTrackingNos = [...new Set(
+      (input.trackingNos ?? []).map((value) => value.trim()).filter(Boolean),
+    )];
     if (!orderIds.length && !requestedTrackingNos.length) {
       throw new BadRequestException('Không có mã vận đơn để in nhãn');
     }
@@ -983,7 +1004,11 @@ export class ShippingService {
       raw = result.raw;
     } else if (shippingOrder.provider === ShippingProvider.VTP) {
       this.assertVtpEnabled();
-      raw = await this.vtpClient.updateStatus(shippingOrder.trackingNo, 4, 'Khách hàng hủy đơn');
+      raw = await this.vtpClient.updateStatus(
+        shippingOrder.trackingNo,
+        4,
+        'Khách hàng hủy đơn',
+      );
     } else {
       throw new BadRequestException('Đơn vị vận chuyển chưa hỗ trợ hủy');
     }
@@ -1294,6 +1319,7 @@ export class ShippingService {
         previousOrder.status,
         mappedStatus,
       );
+      await this.reconcileKiotVietIfPaid(shippingOrder.orderId, previousOrder.status, mappedStatus);
     }
     if (trackingChanged) {
       await this.adminNotifications.publishRealtimeToActiveAdmins('shipping.spx.updated', {
@@ -1330,7 +1356,10 @@ export class ShippingService {
         },
       },
       include: { order: { select: { status: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [
+        { trackingSyncedAt: 'asc' },
+        { createdAt: 'asc' },
+      ],
       ...(input.limit ? { take: input.limit } : {}),
     });
 
@@ -1402,6 +1431,11 @@ export class ShippingService {
           });
           if (mappedStatus) {
             await this.saleWorkStockSync.returnOrderStockIfFinalCancelled(
+              shippingOrder.orderId,
+              shippingOrder.order.status,
+              mappedStatus,
+            );
+            await this.reconcileKiotVietIfPaid(
               shippingOrder.orderId,
               shippingOrder.order.status,
               mappedStatus,
@@ -1595,9 +1629,7 @@ export class ShippingService {
         data: { attemptCount: { increment: 1 }, errorMessage: null },
       });
       const rawPayload = this.toRecord(event.rawPayload);
-      const data = this.toRecord(
-        rawPayload.DATA ?? rawPayload.data ?? rawPayload,
-      ) as VtpWebhookData;
+      const data = this.toRecord(rawPayload.DATA ?? rawPayload.data ?? rawPayload) as VtpWebhookData;
       const orderId = await this.applyVtpWebhookData(data, event.payloadHash);
       await this.prisma.shippingWebhookEvent.update({
         where: { id },
@@ -1722,6 +1754,7 @@ export class ShippingService {
             data: {
               ...(trackingNo ? { trackingCode: trackingNo } : {}),
               status: mapping.orderStatus,
+              ...(previousStatus !== OrderStatus.Paid && mapping.orderStatus === OrderStatus.Paid ? { kiotvietPaidAt: new Date() } : {}),
             },
           });
           if (mapping.restoreInventory && previousStatus) {
@@ -1770,6 +1803,9 @@ export class ShippingService {
         previousStatus,
         mapping.orderStatus,
       );
+    }
+    if (shippingOrder && shouldApply) {
+      await this.reconcileKiotVietIfPaid(shippingOrder.orderId, previousStatus, mapping.orderStatus);
     }
 
     return shippingOrder && shouldApply ? shippingOrder.orderId : undefined;
@@ -1990,6 +2026,7 @@ export class ShippingService {
             data: {
               ...(trackingNo ? { trackingCode: trackingNo } : {}),
               ...(mappedStatus ? { status: mappedStatus } : {}),
+              ...(previousOrder?.status !== OrderStatus.Paid && mappedStatus === OrderStatus.Paid ? { kiotvietPaidAt: new Date() } : {}),
             },
           });
         }
@@ -2032,6 +2069,7 @@ export class ShippingService {
         previousOrder.status,
         mappedStatus,
       );
+      await this.reconcileKiotVietIfPaid(shippingOrder.orderId, previousOrder.status, mappedStatus);
     }
   }
 
@@ -2083,6 +2121,12 @@ export class ShippingService {
 
     const mappedStatus = mapSpxStatusToOrderStatus(track.status, track.statusCode);
     if (track.trackingNo || mappedStatus) {
+      if (mappedStatus === OrderStatus.Paid) {
+        await tx.order.updateMany({
+          where: { id: updated.orderId, status: { notIn: SPX_NON_TERMINAL_UPDATE_BLOCKED_STATUSES }, kiotvietPaidAt: null },
+          data: { kiotvietPaidAt: new Date() },
+        });
+      }
       await tx.order.updateMany({
         where: {
           id: updated.orderId,
@@ -2283,7 +2327,10 @@ export class ShippingService {
     };
   }
 
-  private buildParcel(quoteItems: QuotedOrderItem[], provider: ShippingProvider) {
+  private buildParcel(
+    quoteItems: QuotedOrderItem[],
+    provider: ShippingProvider,
+  ) {
     const parcelItems: ShippingParcelItem[] = quoteItems.map((item) => {
       const weight = item.variant.packageWeightGrams ?? 0;
       if (!Number.isFinite(weight) || weight <= 0) {

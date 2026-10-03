@@ -39,6 +39,7 @@ const booleanKeys = [
   'MINIO_FORCE_PATH_STYLE',
   'MARKETPLACE_ENABLED',
   'MARKETPLACE_CHECKOUT_ENABLED',
+  'KIOTVIET_ENABLED',
 ] as const;
 
 describe('validateEnv boolean flags', () => {
@@ -52,6 +53,13 @@ describe('validateEnv boolean flags', () => {
         ...requiredEnv,
         ...(key === 'MARKETPLACE_ENABLED' || key === 'MARKETPLACE_CHECKOUT_ENABLED'
           ? { ...marketplaceEnv, MARKETPLACE_ENABLED: 'true' }
+          : {}),
+        ...(key === 'KIOTVIET_ENABLED'
+          ? {
+              KIOTVIET_RETAILER: 'shop-test',
+              KIOTVIET_CLIENT_ID: 'client-id',
+              KIOTVIET_CLIENT_SECRET: 'client-secret',
+            }
           : {}),
         [key]: ' TRUE ',
       })[key],
@@ -89,6 +97,100 @@ describe('validateEnv boolean flags', () => {
         MARKETPLACE_CHECKOUT_ENABLED: 'true',
       }),
     ).toThrow('MARKETPLACE_CHECKOUT_ENABLED requires MARKETPLACE_ENABLED=true');
+  });
+});
+
+describe('validateEnv KiotViet configuration', () => {
+  const kiotvietEnv = {
+    KIOTVIET_ENABLED: 'true',
+    KIOTVIET_RETAILER: 'shop-test',
+    KIOTVIET_CLIENT_ID: 'client-id',
+    KIOTVIET_CLIENT_SECRET: 'client-secret',
+  };
+
+  it('requires credentials only when enabled', () => {
+    expect(() => validateEnv({ ...requiredEnv, KIOTVIET_ENABLED: 'true' })).toThrow(
+      'Missing KiotViet configuration',
+    );
+    expect(() => validateEnv({ ...requiredEnv, ...kiotvietEnv })).not.toThrow();
+    expect(() => validateEnv({ ...requiredEnv, KIOTVIET_ENABLED: 'false' })).not.toThrow();
+  });
+
+  it('accepts an empty optional branch ID and rejects invalid IDs', () => {
+    expect(() =>
+      validateEnv({ ...requiredEnv, ...kiotvietEnv, KIOTVIET_BRANCH_ID: '' }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({ ...requiredEnv, ...kiotvietEnv, KIOTVIET_BRANCH_ID: '0' }),
+    ).toThrow();
+  });
+
+  it('requires HTTPS for URL overrides', () => {
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...kiotvietEnv,
+        KIOTVIET_TOKEN_URL: 'http://example.com/token',
+      }),
+    ).toThrow();
+    expect(() =>
+      validateEnv({ ...requiredEnv, ...kiotvietEnv, KIOTVIET_API_BASE_URL: 'https://example.com' }),
+    ).not.toThrow();
+  });
+
+  it('keeps webhook configuration failures non-fatal during API bootstrap', () => {
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...kiotvietEnv,
+        KIOTVIET_STOCK_SYNC_ENABLED: 'true',
+        KIOTVIET_WEBHOOK_ENABLED: 'false',
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...kiotvietEnv,
+        KIOTVIET_STOCK_SYNC_ENABLED: 'true',
+        KIOTVIET_WEBHOOK_ENABLED: 'true',
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...kiotvietEnv,
+        KIOTVIET_STOCK_SYNC_ENABLED: 'true',
+        KIOTVIET_WEBHOOK_ENABLED: 'true',
+        KIOTVIET_CALLBACK_URL: 'http://localhost:3000/api/v1/kiotviet/webhook/stock',
+        KIOTVIET_WEBHOOK_SECRET: 'valid-secret',
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({
+        ...requiredEnv,
+        ...kiotvietEnv,
+        KIOTVIET_STOCK_SYNC_ENABLED: 'true',
+        KIOTVIET_WEBHOOK_ENABLED: 'true',
+        KIOTVIET_CALLBACK_URL: 'https://example.com/api/v1/kiotviet/webhook/stock',
+        KIOTVIET_WEBHOOK_SECRET: 'valid-secret',
+      }),
+    ).not.toThrow();
+  });
+
+  it('uses the cutoff as the manual invoice workflow switch', () => {
+    const invoiceEnv = {
+      ...requiredEnv,
+      ...kiotvietEnv,
+      KIOTVIET_STOCK_SYNC_ENABLED: 'true',
+      KIOTVIET_AUTO_WRITE_FROM: '2026-09-17T08:00:00+07:00',
+    };
+    expect(() => validateEnv(invoiceEnv)).not.toThrow();
+    expect(() =>
+      validateEnv({ ...invoiceEnv, KIOTVIET_AUTO_WRITE_FROM: '2026-09-17T08:00:00' }),
+    ).toThrow('must include a timezone');
+    expect(() =>
+      validateEnv({ ...requiredEnv, ...kiotvietEnv, KIOTVIET_STOCK_SYNC_ENABLED: 'true' }),
+    ).not.toThrow();
   });
 });
 

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 
-import { OrderStatus, Prisma } from '../../generated/prisma/client.js';
+import { InventoryProvider, OrderStatus, Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 
@@ -39,6 +39,7 @@ export class OrderInventoryService {
             productId: true,
             quantity: true,
             flashSaleId: true,
+            variant: { select: { inventoryProvider: true } },
           },
         },
       },
@@ -49,10 +50,12 @@ export class OrderInventoryService {
     for (const item of order.orderProducts) {
       if (!item.variantId) continue;
 
-      await tx.variant.update({
-        where: { id: item.variantId },
-        data: { stock: { increment: item.quantity } },
-      });
+      if (item.variant?.inventoryProvider !== InventoryProvider.KIOTVIET) {
+        await tx.variant.update({
+          where: { id: item.variantId },
+          data: { stock: { increment: item.quantity } },
+        });
+      }
 
       if (!item.flashSaleId) continue;
 

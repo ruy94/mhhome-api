@@ -5,6 +5,7 @@ import { UpdateProductDto } from './dto/update-product.dto.js';
 import { UploadService } from '../upload/upload.service.js';
 import {
   FlashSaleStatus,
+  InventoryProvider,
   MarketplaceOutboxEventType,
   PricingMode,
   Prisma,
@@ -65,42 +66,42 @@ export class ProductService {
     return this.prisma.$transaction(async (tx) => {
       const product = await tx.product.create({
         data: {
-        categoryId: data.categoryId,
-        name: data.name,
-        detail: data.detail,
-        image: data.image,
-        videoUrl: data.videoUrl,
-        videoThumbnail: data.videoThumbnail,
-        source: data.source,
-        warranty: data.warranty,
-        warrantyType: data.warrantyType,
-        tierVariations: tierVariations,
-        fakeSold: data.fakeSold,
-        wholesaleEnabled,
-        ...(wholesaleEnabled && wholesaleUserIds.length
-          ? {
-              wholesaleUsers: {
-                create: wholesaleUserIds.map((userId) => ({ userId })),
-              },
-            }
-          : {}),
-        variants: {
-          create: data.variants.map((variant) => ({
-            name: variant.name,
-            basePrice: variant.basePrice,
-            originalPrice: variant.originalPrice,
-            wholesaleBasePrice: wholesaleEnabled ? variant.wholesaleBasePrice : undefined,
-            wholesalePrice: wholesaleEnabled ? variant.wholesalePrice : undefined,
-            wholesaleMinQuantity: wholesaleEnabled ? variant.wholesaleMinQuantity : undefined,
-            packageWeightGrams: variant.packageWeightGrams ?? 0,
-            packageLengthCm: variant.packageLengthCm,
-            packageWidthCm: variant.packageWidthCm,
-            packageHeightCm: variant.packageHeightCm,
-            stock: variant.stock,
-            image: variant.image,
-            dimensions: variant.dimensions as unknown as Prisma.InputJsonValue,
-          })),
-        },
+          categoryId: data.categoryId,
+          name: data.name,
+          detail: data.detail,
+          image: data.image,
+          videoUrl: data.videoUrl,
+          videoThumbnail: data.videoThumbnail,
+          source: data.source,
+          warranty: data.warranty,
+          warrantyType: data.warrantyType,
+          tierVariations: tierVariations,
+          fakeSold: data.fakeSold,
+          wholesaleEnabled,
+          ...(wholesaleEnabled && wholesaleUserIds.length
+            ? {
+                wholesaleUsers: {
+                  create: wholesaleUserIds.map((userId) => ({ userId })),
+                },
+              }
+            : {}),
+          variants: {
+            create: data.variants.map((variant) => ({
+              name: variant.name,
+              basePrice: variant.basePrice,
+              originalPrice: variant.originalPrice,
+              wholesaleBasePrice: wholesaleEnabled ? variant.wholesaleBasePrice : undefined,
+              wholesalePrice: wholesaleEnabled ? variant.wholesalePrice : undefined,
+              wholesaleMinQuantity: wholesaleEnabled ? variant.wholesaleMinQuantity : undefined,
+              packageWeightGrams: variant.packageWeightGrams ?? 0,
+              packageLengthCm: variant.packageLengthCm,
+              packageWidthCm: variant.packageWidthCm,
+              packageHeightCm: variant.packageHeightCm,
+              stock: variant.stock,
+              image: variant.image,
+              dimensions: variant.dimensions as unknown as Prisma.InputJsonValue,
+            })),
+          },
         },
       });
       await this.marketplaceCatalog.recordProductChanges(tx, [product.id]);
@@ -299,18 +300,13 @@ export class ProductService {
 
   private buildProductOrderBy(
     pageOptionsDto: ProductQueryDto,
-  ):
-    | Prisma.ProductOrderByWithRelationInput
-    | Prisma.ProductOrderByWithRelationInput[] {
+  ): Prisma.ProductOrderByWithRelationInput | Prisma.ProductOrderByWithRelationInput[] {
     const order = pageOptionsDto.order ?? Order.DESC;
     const sortBy = this.resolveSortBy(pageOptionsDto);
 
     if (sortBy === ProductSortBy.NAME) return { name: order };
     if (sortBy === ProductSortBy.SOLD) {
-      return [
-        { fakeSold: { sort: order, nulls: 'last' } },
-        { id: 'asc' },
-      ];
+      return [{ fakeSold: { sort: order, nulls: 'last' } }, { id: 'asc' }];
     }
     return { createdAt: order };
   }
@@ -580,6 +576,7 @@ export class ProductService {
             if (!currentVariantIds.includes(v.id)) {
               throw new BadRequestException(`Variant ID ${v.id} invalid`);
             }
+            const existingVariant = product.variants.find((existing) => existing.id === v.id);
 
             await tx.variant.update({
               where: { id: v.id },
@@ -594,7 +591,10 @@ export class ProductService {
                 packageLengthCm: v.packageLengthCm,
                 packageWidthCm: v.packageWidthCm,
                 packageHeightCm: v.packageHeightCm,
-                stock: v.stock,
+                stock:
+                  existingVariant?.inventoryProvider === InventoryProvider.LOCAL
+                    ? v.stock
+                    : undefined,
                 image: v.image === '' ? null : v.image,
                 dimensions: v.dimensions
                   ? (v.dimensions as unknown as Prisma.InputJsonValue)

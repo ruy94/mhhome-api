@@ -34,6 +34,13 @@ import { OrderInventoryService } from '../order-inventory/order-inventory.servic
 import { MarketplaceCatalogService } from '../marketplace/marketplace-catalog.service.js';
 import { AdminNotificationService } from '../admin-notification/admin-notification.service.js';
 import { generateOrderCode } from './order-code.js';
+import { KiotVietClientService } from '../integrations/kiotviet/kiotviet-client.service.js';
+import { KiotVietService } from '../kiotviet/kiotviet.service.js';
+import { KiotVietOrderExportService } from '../kiotviet/kiotviet-order-export.service.js';
+import {
+  KiotVietSharedStockError,
+  reserveKiotVietSharedStock,
+} from '../kiotviet/kiotviet-shared-inventory.js';
 
 const ORDER_VOUCHER_TYPES: VoucherType[] = [
   VoucherType.Normal,
@@ -135,6 +142,9 @@ export class OrderService {
     private orderInventory: OrderInventoryService,
     private marketplaceCatalog: MarketplaceCatalogService,
     private adminNotifications: AdminNotificationService,
+    private kiotVietClient: KiotVietClientService,
+    private kiotviet: KiotVietService,
+    private kiotVietOrderExport: KiotVietOrderExportService,
   ) {}
 
   private isElectronicInvoiceEnabled() {
@@ -204,6 +214,7 @@ export class OrderService {
   }
 
   async createWebsiteOrder(dto: CreateOrderDto) {
+    await this.kiotviet.ensureCheckoutStockFresh(dto.items.map((item) => item.variantId));
     const order = await this.prisma.$transaction(async (tx) => {
       const checkoutDto = await this.resolveWebsiteCheckoutDto(tx, dto);
       return this.createForPlatformTx(
@@ -215,6 +226,7 @@ export class OrderService {
     });
     await this.adminNotifications.notifyOrderCreated(order);
     await this.saleWorkStockSync.exportOrderStock(order.id);
+    await this.kiotVietOrderExport.onOrderCreated(order.id);
     return order;
   }
 
@@ -325,6 +337,7 @@ export class OrderService {
   }
 
   private async quoteForPlatform(dto: CreateOrderDto, voucherConditionType: ConditionType) {
+    await this.kiotviet.ensureCheckoutStockFresh(dto.items.map((item) => item.variantId));
     return this.prisma.$transaction((tx) =>
       this.calculateOrderQuote(tx, dto, voucherConditionType),
     );
@@ -335,11 +348,13 @@ export class OrderService {
     platform: OrderPlatform,
     voucherConditionType: ConditionType,
   ) {
+    await this.kiotviet.ensureCheckoutStockFresh(dto.items.map((item) => item.variantId));
     const order = await this.prisma.$transaction((tx) =>
       this.createForPlatformTx(tx, dto, platform, voucherConditionType),
     );
     await this.adminNotifications.notifyOrderCreated(order);
     await this.saleWorkStockSync.exportOrderStock(order.id);
+    await this.kiotVietOrderExport.onOrderCreated(order.id);
     return order;
   }
 
@@ -355,6 +370,7 @@ export class OrderService {
 
     const userId = dto.userId;
     const addressId = dto.addressId;
+    await this.assertCheckoutCustomer(tx, userId, addressId);
     const invoiceRequest = this.normalizeElectronicInvoiceRequest(dto);
 
     const quote = await this.calculateOrderQuote(tx, dto, voucherConditionType);
@@ -418,12 +434,11 @@ export class OrderService {
     });
 
     // 5. Update Stock & Usage
-    await this.reserveOrderInventory(tx, orderItems);
+    const sharedInventoryProductIds = await this.reserveOrderInventory(tx, orderItems);
 
-    await this.marketplaceCatalog.recordProductChanges(
-      tx,
-      orderItems.map((item) => item.productId),
-    );
+    await this.marketplaceCatalog.recordProductChanges(tx, [
+      ...new Set([...orderItems.map((item) => item.productId), ...sharedInventoryProductIds]),
+    ]);
 
     const voucherIdsToConsume = [
       ...quote.itemVouchers.map((item) => item.voucherId),
@@ -438,19 +453,64 @@ export class OrderService {
     return order;
   }
 
-  private async reserveOrderInventory(tx: Prisma.TransactionClient, orderItems: QuotedOrderItem[]) {
-    for (const item of orderItems) {
-      const stock = await tx.variant.updateMany({
-        where: {
-          id: item.variantId,
+  private async assertCheckoutCustomer(
+    tx: Prisma.TransactionClient,
+    userId: number,
+    addressId: number,
+  ): Promise<void> {
+    const [user, address] = await Promise.all([
+      tx.user.findFirst({
+        where: { id: userId, isActive: true },
+        select: { id: true },
+      }),
+      tx.address.findFirst({
+        where: { id: addressId, userId, isDeleted: 0 },
+        select: { id: true },
+      }),
+    ]);
+
+    if (!user) throw new BadRequestException('Không tìm thấy người đặt hàng hợp lệ');
+    if (!address) {
+      throw new BadRequestException('Địa chỉ giao hàng không thuộc người đặt hàng');
+    }
+  }
+
+  private async reserveOrderInventory(
+    tx: Prisma.TransactionClient,
+    orderItems: QuotedOrderItem[],
+  ): Promise<Set<number>> {
+    let sharedInventory: Awaited<ReturnType<typeof reserveKiotVietSharedStock>>;
+    try {
+      sharedInventory = await reserveKiotVietSharedStock(
+        tx,
+        orderItems.map((item) => ({
+          variantId: item.variantId,
           productId: item.productId,
-          isDeleted: 0,
-          stock: { gte: item.quantity },
-        },
-        data: { stock: { decrement: item.quantity } },
-      });
-      if (!stock.count) {
-        throw new BadRequestException(`Sản phẩm ${item.variant.name} không đủ tồn kho`);
+          quantity: item.quantity,
+          variantName: item.variant.name,
+        })),
+      );
+    } catch (error) {
+      if (error instanceof KiotVietSharedStockError) {
+        throw new BadRequestException(error.message);
+      }
+      throw error;
+    }
+
+    for (const item of orderItems) {
+      if (!sharedInventory.variantIds.has(item.variantId)) {
+        const stock = await tx.variant.updateMany({
+          where: {
+            id: item.variantId,
+            productId: item.productId,
+            isDeleted: 0,
+            stock: { gte: item.quantity },
+          },
+          data: { stock: { decrement: item.quantity } },
+        });
+        if (!stock.count) {
+          throw new BadRequestException(`Sản phẩm ${item.variant.name} không đủ tồn kho`);
+        }
       }
 
       if (item.flashSaleId) {
@@ -479,6 +539,7 @@ export class OrderService {
         }
       }
     }
+    return sharedInventory.affectedProductIds;
   }
 
   private async resolveWebsiteCheckoutDto(
@@ -639,6 +700,7 @@ export class OrderService {
     if (variants.length !== dto.items.length) {
       throw new BadRequestException('Một số sản phẩm không hợp lệ hoặc đã hết hàng');
     }
+    await this.kiotVietClient.assertStockFresh(variants);
 
     const quoteItems: QuotedOrderItem[] = [];
 
@@ -1085,7 +1147,8 @@ export class OrderService {
     voucher: Voucher & { voucherProducts?: { productId: number }[] },
   ): QuoteVoucher {
     const maxDiscountValue = Number(voucher.maxDiscount ?? 0);
-    const maxDiscount = Number.isFinite(maxDiscountValue) && maxDiscountValue > 0 ? maxDiscountValue : null;
+    const maxDiscount =
+      Number.isFinite(maxDiscountValue) && maxDiscountValue > 0 ? maxDiscountValue : null;
     return {
       id: voucher.id,
       code: voucher.code,
@@ -1422,7 +1485,12 @@ export class OrderService {
     const updated = await this.prisma.$transaction(async (tx) => {
       const updatedOrder = await tx.order.update({
         where: { id },
-        data: { status: nextStatus },
+        data: {
+          status: nextStatus,
+          ...(order.status !== OrderStatus.Paid && nextStatus === OrderStatus.Paid
+            ? { kiotvietPaidAt: new Date() }
+            : {}),
+        },
       });
       await this.orderInventory.restoreIfFinalCancelled(order.id, order.status, nextStatus, tx);
       return updatedOrder;
@@ -1464,6 +1532,18 @@ export class OrderService {
       order.status,
       nextStatus,
     );
+    const automaticKiotVietOrder = await this.kiotVietOrderExport.onOrderStatusChanged(
+      order.id,
+      order.status,
+      nextStatus,
+    );
+    if (
+      !automaticKiotVietOrder &&
+      order.status !== OrderStatus.Paid &&
+      nextStatus === OrderStatus.Paid
+    ) {
+      await this.kiotviet.reconcileAfterOrderPaid(order.id);
+    }
 
     return updated;
   }

@@ -1,11 +1,13 @@
 import { plainToInstance } from 'class-transformer';
 import {
   IsBoolean,
+  IsISO8601,
   IsEnum,
   IsIn,
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
   IsUUID,
   Min,
   validateSync,
@@ -273,19 +275,6 @@ export class EnvironmentVariables {
   SALEWORK_ENABLED?: boolean;
 
   @IsOptional()
-  @IsBoolean()
-  SALEWORK_STOCK_RECONCILIATION_ENABLED?: boolean;
-
-  @IsOptional()
-  @IsString()
-  SALEWORK_STOCK_RECONCILIATION_CRON?: string;
-
-  @IsOptional()
-  @IsInt()
-  @Min(30)
-  SALEWORK_STOCK_RECONCILIATION_LOCK_TTL_SECONDS?: number;
-
-  @IsOptional()
   @IsString()
   SALEWORK_CLIENT_ID?: string;
 
@@ -381,10 +370,95 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsString()
   MARKETPLACE_MEDIA_THUMBNAIL_BASE_URL?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  KIOTVIET_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  KIOTVIET_RETAILER?: string;
+
+  @IsOptional()
+  @IsString()
+  KIOTVIET_CLIENT_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  KIOTVIET_CLIENT_SECRET?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  KIOTVIET_BRANCH_ID?: number;
+
+  @IsOptional()
+  @IsUrl({ require_tld: false, protocols: ['https'], require_protocol: true })
+  KIOTVIET_API_BASE_URL?: string;
+
+  @IsOptional()
+  @IsUrl({ require_tld: false, protocols: ['https'], require_protocol: true })
+  KIOTVIET_TOKEN_URL?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  KIOTVIET_REQUEST_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  KIOTVIET_STOCK_SYNC_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(30)
+  KIOTVIET_STOCK_POLL_SECONDS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(30)
+  KIOTVIET_STOCK_STALE_SECONDS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  KIOTVIET_SAFETY_STOCK?: number;
+
+  @IsOptional()
+  @IsISO8601()
+  KIOTVIET_AUTO_WRITE_FROM?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  KIOTVIET_WEBHOOK_ENABLED?: boolean;
+
+  @IsOptional()
+  @IsString()
+  KIOTVIET_CALLBACK_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  KIOTVIET_WEBHOOK_SECRET?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
   const normalizedConfig = { ...config };
+  for (const key of [
+    'KIOTVIET_BRANCH_ID',
+    'KIOTVIET_API_BASE_URL',
+    'KIOTVIET_TOKEN_URL',
+    'KIOTVIET_REQUEST_TIMEOUT_MS',
+    'KIOTVIET_STOCK_POLL_SECONDS',
+    'KIOTVIET_STOCK_STALE_SECONDS',
+    'KIOTVIET_SAFETY_STOCK',
+    'KIOTVIET_CALLBACK_URL',
+    'KIOTVIET_WEBHOOK_SECRET',
+    'KIOTVIET_AUTO_WRITE_FROM',
+  ]) {
+    if (typeof normalizedConfig[key] === 'string' && !normalizedConfig[key].trim()) {
+      normalizedConfig[key] = undefined;
+    }
+  }
   const booleanKeys = [
     'ELECTRONIC_INVOICE_ENABLED',
     'SPX_ENABLED',
@@ -392,9 +466,11 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
     'VTP_PRINT_SHOW_POSTAGE',
     'SALEWORK_ENABLED',
     'MINIO_FORCE_PATH_STYLE',
-    'SALEWORK_STOCK_RECONCILIATION_ENABLED',
     'MARKETPLACE_ENABLED',
     'MARKETPLACE_CHECKOUT_ENABLED',
+    'KIOTVIET_ENABLED',
+    'KIOTVIET_STOCK_SYNC_ENABLED',
+    'KIOTVIET_WEBHOOK_ENABLED',
   ] as const;
 
   for (const key of booleanKeys) {
@@ -445,6 +521,30 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
         `Env validation failed:\nMissing Marketplace configuration: ${missing.join(', ')}`,
       );
     }
+  }
+  if (validated.KIOTVIET_ENABLED) {
+    const requiredKeys = [
+      'KIOTVIET_RETAILER',
+      'KIOTVIET_CLIENT_ID',
+      'KIOTVIET_CLIENT_SECRET',
+    ] as const;
+    const missing = requiredKeys.filter((key) => !String(validated[key] ?? '').trim());
+    if (missing.length) {
+      throw new Error(
+        `Env validation failed:\nMissing KiotViet configuration: ${missing.join(', ')}`,
+      );
+    }
+  }
+  if (validated.KIOTVIET_STOCK_SYNC_ENABLED && !validated.KIOTVIET_ENABLED) {
+    throw new Error(
+      'Env validation failed:\nKIOTVIET_STOCK_SYNC_ENABLED requires KIOTVIET_ENABLED',
+    );
+  }
+  if (
+    validated.KIOTVIET_AUTO_WRITE_FROM &&
+    !/(?:Z|[+-]\d{2}:\d{2})$/.test(validated.KIOTVIET_AUTO_WRITE_FROM)
+  ) {
+    throw new Error('Env validation failed:\nKIOTVIET_AUTO_WRITE_FROM must include a timezone');
   }
   if (validated.VTP_ENABLED) {
     const requiredVtpKeys = [

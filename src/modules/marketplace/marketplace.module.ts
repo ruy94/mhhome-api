@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
 import marketplaceConfig from '../../config/marketplace.config.js';
@@ -17,9 +17,17 @@ import { MarketplaceIdempotencyInterceptor } from './marketplace-idempotency.int
 import { MarketplaceReservationService } from './marketplace-reservation.service.js';
 import { SaleWorkStockSyncModule } from '../salework-sync/salework-stock-sync.module.js';
 import { AdminNotificationModule } from '../admin-notification/admin-notification.module.js';
+import { KiotVietIntegrationModule } from '../integrations/kiotviet/kiotviet-integration.module.js';
+import { KiotVietModule } from '../kiotviet/kiotviet.module.js';
 
 @Module({
-  imports: [ConfigModule.forFeature(marketplaceConfig), SaleWorkStockSyncModule, AdminNotificationModule],
+  imports: [
+    ConfigModule.forFeature(marketplaceConfig),
+    SaleWorkStockSyncModule,
+    AdminNotificationModule,
+    KiotVietIntegrationModule,
+    forwardRef(() => KiotVietModule),
+  ],
   controllers: [MarketplaceSourceController, MiniappMarketplaceController],
   providers: [
     MarketplaceCatalogService,

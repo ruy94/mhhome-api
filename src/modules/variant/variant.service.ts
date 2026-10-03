@@ -6,6 +6,8 @@ import {
   Prisma,
   FlashSaleStatus,
   MarketplaceReservationStatus,
+  InventoryProvider,
+  OrderStatus,
 } from '../../generated/prisma/client.js';
 import { UploadService } from '../upload/upload.service.js';
 import { ConfigService } from '@nestjs/config';
@@ -47,6 +49,9 @@ export class VariantService {
       where: { id, isDeleted: 0 },
     });
     if (!variant) throw new NotFoundException('Variant not found');
+    if (variant.inventoryProvider === InventoryProvider.KIOTVIET && dto.stock !== undefined) {
+      throw new BadRequestException('Tồn SKU KiotViet được quản lý qua đồng bộ');
+    }
 
     const nextImage = dto.image === '' ? null : (dto.image ?? variant.image);
     const updatedVariant = await this.prisma.$transaction(async (tx) => {
@@ -87,6 +92,10 @@ export class VariantService {
 
     const variant = await this.prisma.variant.findUnique({ where: { id, isDeleted: 0 } });
     if (!variant) throw new NotFoundException('Variant not found');
+    if (variant.kiotvietProductCode || variant.kiotvietBranchId) {
+      throw new BadRequestException('Hãy hủy liên kết KiotViet trước khi liên kết SaleWork');
+    }
+    await this.assertNoActiveHolds(id);
 
     const linked = await this.prisma.variant.findFirst({
       where: {
@@ -99,7 +108,7 @@ export class VariantService {
     });
     if (linked) throw new BadRequestException('SKU SaleWork này đã được liên kết với SKU khác');
 
-    const updateData: Prisma.VariantUpdateInput = { saleworkProductCode, saleworkWarehouseId };
+    const updateData: Prisma.VariantUpdateInput = { saleworkProductCode, saleworkWarehouseId, inventoryProvider: InventoryProvider.SALEWORK };
 
     if (this.configService.get<boolean>('salework.enabled') === true) {
       const salework = await this.saleworkClient.getProducts();
@@ -138,15 +147,28 @@ export class VariantService {
   async unlinkSalework(id: number) {
     const variant = await this.prisma.variant.findUnique({ where: { id, isDeleted: 0 } });
     if (!variant) throw new NotFoundException('Variant not found');
+    await this.assertNoActiveHolds(id);
 
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.variant.update({
         where: { id },
-        data: { saleworkProductCode: null, saleworkWarehouseId: null },
+        data: { saleworkProductCode: null, saleworkWarehouseId: null, inventoryProvider: InventoryProvider.LOCAL },
       });
       await this.marketplaceCatalog.recordProductChanges(tx, [variant.productId]);
       return updated;
     });
+  }
+
+  private async assertNoActiveHolds(id: number): Promise<void> {
+    const [orders, reservations] = await Promise.all([
+      this.prisma.orderProduct.count({
+        where: { variantId: id, order: { status: { notIn: [OrderStatus.Cancel, OrderStatus.Refund, OrderStatus.Return] } } },
+      }),
+      this.prisma.marketplaceInventoryReservation.count({
+        where: { variantId: id, reservation: { status: MarketplaceReservationStatus.Reserved } },
+      }),
+    ]);
+    if (orders || reservations) throw new BadRequestException('SKU còn đơn hoặc giữ hàng; chưa thể đổi nguồn tồn');
   }
 
   // --- LOGIC CASCADE DELETE ---

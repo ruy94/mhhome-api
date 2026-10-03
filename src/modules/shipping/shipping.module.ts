@@ -9,13 +9,14 @@ import { VtpWebhookController } from './vtp-webhook.controller.js';
 import { VtpWebhookSignatureGuard } from './vtp-webhook-signature.guard.js';
 import { ShippingService } from './shipping.service.js';
 import { SaleWorkStockSyncModule } from '../salework-sync/salework-stock-sync.module.js';
-import { RedisModule } from '../../common/redis/redis.module.js';
-import { AdminNotificationModule } from '../admin-notification/admin-notification.module.js';
 import { OrderInventoryModule } from '../order-inventory/order-inventory.module.js';
 import { MarketplaceModule } from '../marketplace/marketplace.module.js';
+import { RedisModule } from '../../common/redis/redis.module.js';
+import { AdminNotificationModule } from '../admin-notification/admin-notification.module.js';
+import { KiotVietModule } from '../kiotviet/kiotviet.module.js';
 
 @Module({
-  imports: [SpxShippingModule, VtpShippingModule, SaleWorkStockSyncModule, OrderInventoryModule, MarketplaceModule, RedisModule, AdminNotificationModule],
+  imports: [SpxShippingModule, VtpShippingModule, SaleWorkStockSyncModule, OrderInventoryModule, MarketplaceModule, RedisModule, AdminNotificationModule, KiotVietModule],
   controllers: [ShippingController, SpxWebhookController, VtpWebhookController],
   providers: [ShippingService, SpxWebhookSignatureGuard, VtpWebhookSignatureGuard],
   exports: [ShippingService],

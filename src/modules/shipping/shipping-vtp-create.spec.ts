@@ -169,6 +169,7 @@ describe('ShippingService VTP create and approval recovery', () => {
       {} as never,
       {} as never,
       {} as never,
+      { reconcileAfterOrderPaid: jest.fn().mockResolvedValue(undefined) } as never,
     );
     return { prisma, service, stored: () => ({ order: storedOrder, shippingOrder: storedShippingOrder }), vtp };
   }
@@ -285,6 +286,7 @@ describe('ShippingService mixed-provider AWB contract', () => {
       {} as never,
       {} as never,
       {} as never,
+      { reconcileAfterOrderPaid: jest.fn().mockResolvedValue(undefined) } as never,
     );
 
     await expect(service.getAwbForOrders({ orderIds: [1, 2] })).resolves.toEqual({

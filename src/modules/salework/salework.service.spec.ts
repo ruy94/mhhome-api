@@ -45,8 +45,8 @@ describe('SaleworkService syncLinkedVariantStocks', () => {
     const marketplaceCatalog = { recordProductChanges: jest.fn().mockResolvedValue(undefined) };
     const configService = { get: jest.fn() };
     const redis = { getClient: jest.fn() };
-    const schedulerRegistry = { addCronJob: jest.fn() };
     const adminNotifications = { publishRealtimeToActiveAdmins: jest.fn().mockResolvedValue(undefined) };
+    const schedulerRegistry = { addCronJob: jest.fn() };
 
     return {
       service: new SaleworkService(

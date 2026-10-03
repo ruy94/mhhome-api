@@ -15,6 +15,7 @@ import saleworkConfig from './config/salework.config.js';
 import zaloConfig from './config/zalo.config.js';
 import storageConfig from './config/storage.config.js';
 import marketplaceConfig from './config/marketplace.config.js';
+import kiotvietConfig from './config/kiotviet.config.js';
 import { validateEnv } from './config/env.validation.js';
 
 import { PrismaModule } from './prisma/prisma.module.js';
@@ -57,6 +58,7 @@ import { PublicConfigModule } from './modules/public-config/public-config.module
 import { MarketplaceModule } from './modules/marketplace/marketplace.module.js';
 import { StorageModule } from './modules/storage/storage.module.js';
 import { AdminNotificationModule } from './modules/admin-notification/admin-notification.module.js';
+import { KiotVietModule } from './modules/kiotviet/kiotviet.module.js';
 
 const vietnamDateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Ho_Chi_Minh',
@@ -105,6 +107,7 @@ function vietnamTimestamp(): string {
         zaloConfig,
         storageConfig,
         marketplaceConfig,
+        kiotvietConfig,
       ],
       validate: validateEnv,
       envFilePath: [`.env.${process.env.NODE_ENV ?? 'development'}`],
@@ -191,6 +194,7 @@ function vietnamTimestamp(): string {
     WebhookReceiverModule,
     MarketplaceModule,
     AdminNotificationModule,
+    KiotVietModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: GlobalExceptionFilter },

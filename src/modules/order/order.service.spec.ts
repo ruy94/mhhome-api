@@ -44,6 +44,12 @@ describe('OrderService product item vouchers', () => {
       {} as never,
       { recordProductChanges: jest.fn() } as never,
       { notifyOrderCreated: jest.fn() } as never,
+      { assertStockFresh: jest.fn().mockResolvedValue(undefined) } as never,
+      { reconcileAfterOrderPaid: jest.fn().mockResolvedValue(undefined) } as never,
+      {
+        onOrderCreated: jest.fn().mockResolvedValue(undefined),
+        onOrderStatusChanged: jest.fn().mockResolvedValue(false),
+      } as never,
     );
 
   const createTx = (variants: unknown[], voucher: unknown) =>
@@ -82,12 +88,8 @@ describe('OrderService product item vouchers', () => {
       maxDiscount: { toString: () => '10000' },
     });
 
-    expect(
-      (service as any).calculateVoucherDiscount(uncappedVoucher, 689_000),
-    ).toBe(137_800);
-    expect(
-      (service as any).calculateVoucherDiscount(cappedVoucher, 689_000),
-    ).toBe(10_000);
+    expect((service as any).calculateVoucherDiscount(uncappedVoucher, 689_000)).toBe(137_800);
+    expect((service as any).calculateVoucherDiscount(cappedVoucher, 689_000)).toBe(10_000);
     expect((service as any).serializeVoucher(uncappedVoucher)).toMatchObject({
       maxDiscount: null,
     });
@@ -306,7 +308,18 @@ describe('OrderService product item vouchers', () => {
   it('atomically rejects local stock already held by another checkout', async () => {
     const service = createService();
     const tx = {
-      variant: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+      variant: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 101,
+            productId: 1,
+            inventoryProvider: 'LOCAL',
+            kiotvietProductCode: null,
+            kiotvietBranchId: null,
+          },
+        ]),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
     } as never;
 
     await expect(
@@ -328,7 +341,18 @@ describe('OrderService product item vouchers', () => {
   it('atomically rejects a flash-sale allocation taken by another checkout', async () => {
     const service = createService();
     const tx = {
-      variant: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      variant: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 101,
+            productId: 1,
+            inventoryProvider: 'LOCAL',
+            kiotvietProductCode: null,
+            kiotvietBranchId: null,
+          },
+        ]),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
       flashSaleItem: {
         findUnique: jest.fn().mockResolvedValue({ id: 7, saleStock: 5 }),
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
@@ -351,6 +375,22 @@ describe('OrderService product item vouchers', () => {
       data: { sold: { increment: 2 } },
     });
   });
+
+  it('rejects an address that does not belong to the ordering user', async () => {
+    const service = createService();
+    const tx = {
+      user: { findFirst: jest.fn().mockResolvedValue({ id: 12 }) },
+      address: { findFirst: jest.fn().mockResolvedValue(null) },
+    } as never;
+
+    await expect((service as any).assertCheckoutCustomer(tx, 12, 34)).rejects.toThrow(
+      'Địa chỉ giao hàng không thuộc người đặt hàng',
+    );
+    expect((tx as any).address.findFirst).toHaveBeenCalledWith({
+      where: { id: 34, userId: 12, isDeleted: 0 },
+      select: { id: true },
+    });
+  });
 });
 
 describe('OrderService admin order search', () => {
@@ -364,6 +404,12 @@ describe('OrderService admin order search', () => {
       {} as never,
       { recordProductChanges: jest.fn() } as never,
       { notifyOrderCreated: jest.fn() } as never,
+      { assertStockFresh: jest.fn().mockResolvedValue(undefined) } as never,
+      { reconcileAfterOrderPaid: jest.fn().mockResolvedValue(undefined) } as never,
+      {
+        onOrderCreated: jest.fn().mockResolvedValue(undefined),
+        onOrderStatusChanged: jest.fn().mockResolvedValue(false),
+      } as never,
     );
 
   const createOrder = () => ({

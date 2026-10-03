@@ -10,6 +10,7 @@ jest.mock('../../prisma/prisma.service.js', () => ({ PrismaService: class Prisma
 jest.mock('./marketplace-catalog.service.js', () => ({
   MarketplaceCatalogService: class MarketplaceCatalogService {},
 }));
+jest.mock('../kiotviet/kiotviet.service.js', () => ({ KiotVietService: class KiotVietService {} }));
 import {
   MarketplaceQuoteMode,
   MarketplaceVoucherSelectionMode,
@@ -27,7 +28,12 @@ describe('MarketplaceCommerceService', () => {
   const catalog = {
     resolveMedia: jest.fn((value: string | null | undefined) => value ?? null),
   };
-  const service = new MarketplaceCommerceService(prisma as never, catalog as never);
+  const service = new MarketplaceCommerceService(
+    prisma as never,
+    catalog as never,
+    { assertStockFresh: jest.fn().mockResolvedValue(undefined) } as never,
+    { ensureCheckoutStockFresh: jest.fn().mockResolvedValue(undefined) } as never,
+  );
 
   const variant = {
     id: 11,

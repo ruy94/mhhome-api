@@ -11,10 +11,27 @@ import { SaleWorkStockSyncModule } from '../salework-sync/salework-stock-sync.mo
 import { OrderInventoryModule } from '../order-inventory/order-inventory.module.js';
 import { MarketplaceModule } from '../marketplace/marketplace.module.js';
 import { AdminNotificationModule } from '../admin-notification/admin-notification.module.js';
+import { KiotVietModule } from '../kiotviet/kiotviet.module.js';
+import { KiotVietIntegrationModule } from '../integrations/kiotviet/kiotviet-integration.module.js';
 
 @Module({
-  imports: [AffiliateModule, ShippingModule, SaleWorkStockSyncModule, OrderInventoryModule, MarketplaceModule, AdminNotificationModule],
-  controllers: [OrderController, MiniappOrderController, WebsiteOrderController, MiniappShippingController, WebsiteShippingController],
+  imports: [
+    AffiliateModule,
+    ShippingModule,
+    SaleWorkStockSyncModule,
+    OrderInventoryModule,
+    MarketplaceModule,
+    AdminNotificationModule,
+    KiotVietIntegrationModule,
+    KiotVietModule,
+  ],
+  controllers: [
+    OrderController,
+    MiniappOrderController,
+    WebsiteOrderController,
+    MiniappShippingController,
+    WebsiteShippingController,
+  ],
   providers: [OrderService],
   exports: [OrderService],
 })
